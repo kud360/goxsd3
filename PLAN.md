@@ -13,20 +13,25 @@ A Go library and CLI tool that:
 ## Architecture Overview
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌──────────────────┐     ┌──────────────┐
+                     ┌───────────────────┐
+                     │  Built-in Types   │
+                     │  (hfp: registry)  │
+                     └────────┬──────────┘
+                              │ bootstrap
+┌──────────────┐     ┌───────▼──────┐     ┌──────────────────┐     ┌──────────────┐
 │  XSD Files   │────▶│    Parser    │────▶│   Schema Model   │────▶│   CodeGen    │
 │  (.xsd)      │     │  (Phase 1)   │     │   (AST / IR)     │     │  (Phase 2)   │
 └──────────────┘     └──────────────┘     └──────────────────┘     └──────────────┘
-                           │                      │                       │
-                     ┌─────▼─────┐          ┌─────▼─────┐          ┌─────▼──────┐
-                     │  Parser   │          │  Model    │          │  CodeGen   │
-                     │  Hooks    │          │  Hooks    │          │  Hooks     │
-                     └───────────┘          └───────────┘          └────────────┘
+       │                   │                      │                       │
+  ┌────▼────┐        ┌─────▼─────┐          ┌─────▼─────┐          ┌─────▼──────┐
+  │ import/ │        │  Parser   │          │  Model    │          │  CodeGen   │
+  │ include │        │  Hooks    │          │  Hooks    │          │  Hooks     │
+  └─────────┘        └───────────┘          └───────────┘          └────────────┘
                                                                         │
-                                                              ┌─────────┼─────────┐
-                                                              ▼         ▼         ▼
-                                                           XML       JSON       BER
-                                                         Marshal   Marshal   Marshal
+                           ┌──────────────────────┐           ┌─────────┼─────────┐
+                           │  Streaming Parser     │           ▼         ▼         ▼
+                           │  (SAX-style events)   │        XML       JSON       BER
+                           └──────────────────────┘       Marshal   Marshal   Marshal
 ```
 
 ### Package Layout
@@ -40,12 +45,19 @@ goxsd3/
 ├── xsd/                 # XSD model types (the AST / IR)
 │   ├── model.go         # Core schema model types
 │   ├── types.go         # Simple/complex type definitions
-│   ├── compositor.go    # Sequence, Choice, All
+│   ├── builtin.go       # Built-in type registry (hfp: definitions)
+│   ├── builtin_test.go  # Comprehensive built-in type tests
+│   ├── facets.go        # Facet definitions, applicability, inheritance
+│   ├── compositor.go    # Sequence, Choice, All (nested support)
 │   ├── constraint.go    # Facets, assertions, identity constraints
 │   └── namespace.go     # Namespace & import resolution
 ├── parser/              # XSD parser (XML → model)
-│   ├── parser.go        # Main parser
-│   ├── resolve.go       # Type/ref resolution, import/include
+│   ├── parser.go        # Main parser (DOM-style, full schema load)
+│   ├── streaming.go     # Streaming parser (SAX-style event callbacks)
+│   ├── resolve.go       # Type/ref resolution, import/include/redefine
+│   ├── import.go        # xs:import handler (cross-namespace)
+│   ├── include.go       # xs:include handler (same-namespace)
+│   ├── catalog.go       # XML Catalog support for schema resolution
 │   ├── options.go       # Parser options
 │   └── hooks.go         # Parser hook interfaces
 ├── codegen/             # Go code generation (model → Go source)
@@ -69,10 +81,259 @@ goxsd3/
 │   └── loader.go        # Plugin discovery/loading
 └── testdata/            # XSD test fixtures
     ├── basic/
+    ├── builtin/         # Built-in type tests (all 49 types)
     ├── choice/
     ├── complex/
-    ├── imports/
+    ├── derivation/      # SimpleType restriction, ComplexType extension
+    ├── imports/         # import/include/redefine multi-file tests
+    ├── nested/          # Deeply nested compositor tests
+    ├── streaming/       # Streaming parser test fixtures
     └── xsd11/
+```
+
+---
+
+## Phase 0: Built-in Type System (hfp: Registry)
+
+The XSD spec defines all 49 built-in types in its own `datatypes.xsd` using the
+`hfp:` namespace (`http://www.w3.org/2001/XMLSchema-hasFacetAndProperty`). Our
+type system must bootstrap from these definitions so that user-defined types
+inherit the correct facet applicability.
+
+### 0.1 The hfp: Mechanism
+
+In the W3C's `datatypes.xsd`, each built-in type is annotated with:
+- `hfp:hasFacet name="..."` — declares which constraining facets apply
+- `hfp:hasProperty name="..." value="..."` — declares type properties (ordered, bounded, cardinality, numeric)
+
+Example from the spec:
+```xml
+<xs:simpleType name="string" id="string">
+  <xs:annotation>
+    <xs:appinfo>
+      <hfp:hasFacet name="length"/>
+      <hfp:hasFacet name="minLength"/>
+      <hfp:hasFacet name="maxLength"/>
+      <hfp:hasFacet name="pattern"/>
+      <hfp:hasFacet name="enumeration"/>
+      <hfp:hasFacet name="whiteSpace"/>
+    </xs:appinfo>
+  </xs:annotation>
+  <xs:restriction base="xs:anySimpleType">
+    <xs:whiteSpace value="preserve"/>
+  </xs:restriction>
+</xs:simpleType>
+```
+
+### 0.2 Built-in Type Registry (`xsd/builtin.go`)
+
+```go
+package xsd
+
+// BuiltinTypeInfo describes a built-in XSD type's facet support and properties.
+type BuiltinTypeInfo struct {
+    Name           QName
+    GoType         string          // Go type mapping (string, int64, float64, etc.)
+    Base           *QName          // Parent type in derivation hierarchy (nil for anyType)
+    ApplicableFacets []FacetKind   // From hfp:hasFacet
+    Properties     TypeProperties  // From hfp:hasProperty
+    WhiteSpace     WhiteSpaceRule  // Inherited or fixed
+}
+
+type TypeProperties struct {
+    Ordered     Ordered     // false, partial, total
+    Bounded     bool
+    Cardinality Cardinality // finite, countably infinite
+    Numeric     bool
+}
+
+// BuiltinRegistry holds all 49 built-in types and their derivation chains.
+type BuiltinRegistry struct {
+    types map[QName]*BuiltinTypeInfo
+}
+
+// NewBuiltinRegistry creates a registry pre-populated with all XSD built-in types.
+func NewBuiltinRegistry() *BuiltinRegistry
+
+// Lookup returns type info for a built-in type (nil if not built-in).
+func (r *BuiltinRegistry) Lookup(name QName) *BuiltinTypeInfo
+
+// ApplicableFacets returns all facets applicable to a type, including inherited.
+func (r *BuiltinRegistry) ApplicableFacets(name QName) []FacetKind
+
+// IsValidRestriction checks if applying the given facets to derive from base is valid.
+func (r *BuiltinRegistry) IsValidRestriction(base QName, facets []Facet) error
+
+// GoType returns the Go type for a built-in XSD type.
+func (r *BuiltinRegistry) GoType(name QName) string
+```
+
+### 0.3 Complete Built-in Type Hierarchy
+
+```
+anyType
+├── anySimpleType
+│   ├── string
+│   │   ├── normalizedString
+│   │   │   └── token
+│   │   │       ├── language
+│   │   │       ├── NMTOKEN
+│   │   │       ├── Name
+│   │   │       │   └── NCName
+│   │   │       │       ├── ID
+│   │   │       │       ├── IDREF
+│   │   │       │       └── ENTITY
+│   │   │       └── (token-derived)
+│   │   └── (string-derived)
+│   ├── boolean
+│   ├── decimal
+│   │   └── integer
+│   │       ├── nonPositiveInteger
+│   │       │   └── negativeInteger
+│   │       ├── long
+│   │       │   └── int
+│   │       │       └── short
+│   │       │           └── byte
+│   │       ├── nonNegativeInteger
+│   │       │   ├── unsignedLong
+│   │       │   │   └── unsignedInt
+│   │       │   │       └── unsignedShort
+│   │       │   │           └── unsignedByte
+│   │       │   └── positiveInteger
+│   │       └── (integer-derived)
+│   ├── float
+│   ├── double
+│   ├── duration
+│   │   ├── yearMonthDuration    (XSD 1.1)
+│   │   └── dayTimeDuration      (XSD 1.1)
+│   ├── dateTime
+│   │   └── dateTimeStamp        (XSD 1.1)
+│   ├── time
+│   ├── date
+│   ├── gYearMonth
+│   ├── gYear
+│   ├── gMonthDay
+│   ├── gDay
+│   ├── gMonth
+│   ├── hexBinary
+│   ├── base64Binary
+│   ├── anyURI
+│   ├── QName
+│   └── NOTATION
+└── (complex types derive from anyType)
+```
+
+### 0.4 Facet Applicability Table
+
+| Type Family     | length | minLen | maxLen | pattern | enum | whiteSpace | maxIncl | maxExcl | minIncl | minExcl | totalDig | fracDig |
+|-----------------|--------|--------|--------|---------|------|------------|---------|---------|---------|---------|----------|---------|
+| string          |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓      |         |         |         |         |          |         |
+| boolean         |        |        |        |    ✓    |      |     ✓      |         |         |         |         |          |         |
+| decimal         |        |        |        |    ✓    |  ✓   |     ✓      |    ✓    |    ✓    |    ✓    |    ✓    |    ✓     |    ✓    |
+| float/double    |        |        |        |    ✓    |  ✓   |     ✓      |    ✓    |    ✓    |    ✓    |    ✓    |          |         |
+| duration        |        |        |        |    ✓    |  ✓   |     ✓      |    ✓    |    ✓    |    ✓    |    ✓    |          |         |
+| dateTime/date.. |        |        |        |    ✓    |  ✓   |     ✓      |    ✓    |    ✓    |    ✓    |    ✓    |          |         |
+| hexBinary       |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓      |         |         |         |         |          |         |
+| base64Binary    |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓      |         |         |         |         |          |         |
+| anyURI          |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓      |         |         |         |         |          |         |
+| QName/NOTATION  |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓      |         |         |         |         |          |         |
+| integer         |        |        |        |    ✓    |  ✓   |     ✓      |    ✓    |    ✓    |    ✓    |    ✓    |    ✓     |    ✓*   |
+
+*fractionDigits is fixed to 0 for integer types.
+
+### 0.5 User-Defined Type Derivation
+
+Users create new types by **restricting** built-in types or other user types:
+
+```xml
+<!-- SimpleType: restrict string with facets -->
+<xs:simpleType name="ZipCode">
+  <xs:restriction base="xs:string">
+    <xs:pattern value="\d{5}(-\d{4})?"/>
+    <xs:maxLength value="10"/>
+  </xs:restriction>
+</xs:simpleType>
+
+<!-- SimpleType: restrict integer with range -->
+<xs:simpleType name="Percentage">
+  <xs:restriction base="xs:integer">
+    <xs:minInclusive value="0"/>
+    <xs:maxInclusive value="100"/>
+  </xs:restriction>
+</xs:simpleType>
+
+<!-- SimpleType: list of tokens -->
+<xs:simpleType name="ColorList">
+  <xs:list itemType="xs:token"/>
+</xs:simpleType>
+
+<!-- SimpleType: union of types -->
+<xs:simpleType name="SizeOrName">
+  <xs:union memberTypes="xs:integer xs:string"/>
+</xs:simpleType>
+
+<!-- ComplexType: extend a base with new elements -->
+<xs:complexType name="USAddress">
+  <xs:complexContent>
+    <xs:extension base="AddressType">
+      <xs:sequence>
+        <xs:element name="state" type="xs:string"/>
+        <xs:element name="zip" type="ZipCode"/>
+      </xs:sequence>
+    </xs:extension>
+  </xs:complexContent>
+</xs:complexType>
+
+<!-- ComplexType: restrict a base (narrow constraints) -->
+<xs:complexType name="SmallOrder">
+  <xs:complexContent>
+    <xs:restriction base="OrderType">
+      <xs:sequence>
+        <xs:element name="item" type="xs:string" maxOccurs="5"/>
+      </xs:sequence>
+    </xs:restriction>
+  </xs:complexContent>
+</xs:complexType>
+```
+
+**Inheritance chain**: The parser must track the full derivation chain so that:
+1. Facet applicability is inherited from base types
+2. Facets can only be made *more restrictive* (never relaxed)
+3. ComplexType extension appends new particles to the base content model
+4. ComplexType restriction narrows the base content model
+
+### 0.6 Built-in Type Tests (`xsd/builtin_test.go`)
+
+**Comprehensive test coverage for all 49 built-in types:**
+
+```go
+// Test categories:
+// 1. Registry completeness — all 49 types present
+// 2. Hierarchy — derivation chains are correct
+// 3. Facet applicability — each type supports exactly the right facets
+// 4. Go type mapping — each built-in maps to the correct Go type
+// 5. Restriction validation — valid/invalid facet application
+// 6. Property inheritance — ordered, bounded, numeric propagation
+
+func TestAllBuiltinTypesPresent(t *testing.T)          // all 49 types registered
+func TestBuiltinDerivationChain(t *testing.T)          // integer→decimal→anySimpleType→anyType
+func TestStringFamilyFacets(t *testing.T)              // string, normalizedString, token, language, ...
+func TestNumericFamilyFacets(t *testing.T)             // decimal, integer, long, int, short, byte, ...
+func TestDateTimeFamilyFacets(t *testing.T)            // dateTime, date, time, gYear, ...
+func TestBinaryFamilyFacets(t *testing.T)              // hexBinary, base64Binary
+func TestBooleanFacets(t *testing.T)                   // only pattern, whiteSpace
+func TestGoTypeMappings(t *testing.T)                  // xs:int→int32, xs:long→int64, ...
+func TestValidRestriction(t *testing.T)                // pattern on string → OK
+func TestInvalidRestriction(t *testing.T)              // totalDigits on string → error
+func TestFacetInheritance(t *testing.T)                // token inherits string's facets
+func TestFacetNarrowing(t *testing.T)                  // can tighten maxLength, can't loosen
+func TestXSD11BuiltinTypes(t *testing.T)               // yearMonthDuration, dayTimeDuration, dateTimeStamp
+func TestTypeProperties(t *testing.T)                  // ordered, bounded, numeric, cardinality
+func TestUserDefinedSimpleTypeRestriction(t *testing.T) // ZipCode restricts string
+func TestUserDefinedSimpleTypeList(t *testing.T)       // list of tokens
+func TestUserDefinedSimpleTypeUnion(t *testing.T)      // union of integer|string
+func TestComplexTypeExtension(t *testing.T)            // USAddress extends AddressType
+func TestComplexTypeRestriction(t *testing.T)          // SmallOrder restricts OrderType
 ```
 
 ---
@@ -156,7 +417,9 @@ type ComplexType struct {
 }
 ```
 
-### 1.3 Compositors (`xsd/compositor.go`)
+### 1.3 Compositors & Nested Compositor Support (`xsd/compositor.go`)
+
+Compositors can nest arbitrarily deep. This is a key area where existing tools fail.
 
 ```go
 // Content is the interface for complex type content models.
@@ -164,29 +427,98 @@ type Content interface {
     isContent()
 }
 
+// Compositor is the shared interface for Sequence, Choice, and All.
+// Compositors are themselves Particles, enabling arbitrary nesting.
+type Compositor interface {
+    Particle
+    Content
+    GetParticles() []Particle
+    GetMinOccurs() int
+    GetMaxOccurs() int
+}
+
 type Sequence struct {
     MinOccurs int
     MaxOccurs int
-    Particles []Particle // Element | Group | Choice | Sequence | All | Any
+    Particles []Particle // Element | GroupRef | Choice | Sequence | All | Any
 }
+func (Sequence) isParticle() {}
+func (Sequence) isContent()  {}
 
 type Choice struct {
     MinOccurs int
     MaxOccurs int
     Particles []Particle
 }
+func (Choice) isParticle() {}
+func (Choice) isContent()  {}
 
 type All struct {
     MinOccurs int
     MaxOccurs int  // XSD 1.1 allows > 1
     Particles []Particle
 }
+func (All) isParticle() {}
+func (All) isContent()  {}
 
 // Particle is anything that can appear in a compositor.
 type Particle interface {
     isParticle()
 }
+
+// Element, GroupRef, and Any are also Particles (implement isParticle).
 ```
+
+**Nesting examples that MUST work:**
+```xml
+<!-- Choice inside Sequence -->
+<xs:sequence>
+  <xs:element name="header" type="xs:string"/>
+  <xs:choice>
+    <xs:element name="optionA" type="xs:string"/>
+    <xs:element name="optionB" type="xs:int"/>
+  </xs:choice>
+  <xs:element name="footer" type="xs:string"/>
+</xs:sequence>
+
+<!-- Sequence inside Choice -->
+<xs:choice>
+  <xs:sequence>
+    <xs:element name="first" type="xs:string"/>
+    <xs:element name="last" type="xs:string"/>
+  </xs:sequence>
+  <xs:element name="fullName" type="xs:string"/>
+</xs:choice>
+
+<!-- Choice inside Choice -->
+<xs:choice>
+  <xs:choice>
+    <xs:element name="a" type="xs:string"/>
+    <xs:element name="b" type="xs:string"/>
+  </xs:choice>
+  <xs:element name="c" type="xs:string"/>
+</xs:choice>
+
+<!-- Deep nesting: sequence > choice > sequence > choice -->
+<xs:sequence>
+  <xs:choice>
+    <xs:sequence>
+      <xs:element name="x" type="xs:string"/>
+      <xs:choice>
+        <xs:element name="y1" type="xs:string"/>
+        <xs:element name="y2" type="xs:int"/>
+      </xs:choice>
+    </xs:sequence>
+    <xs:element name="z" type="xs:string"/>
+  </xs:choice>
+</xs:sequence>
+```
+
+**Codegen strategy for nested compositors:**
+- Nested choices generate nested interfaces (e.g., `OuterChoice` with one variant being a struct containing an `InnerChoice` interface field)
+- Sequence inside choice: the sequence becomes a struct variant of the choice
+- Choice inside sequence: the choice becomes an interface field of the struct
+- Recursive flattening is applied where possible (choice-in-choice can flatten to single interface)
 
 ### 1.4 Constraints & Facets (`xsd/constraint.go`)
 
@@ -245,15 +577,220 @@ func (p *Parser) Parse(files ...string) (*xsd.SchemaSet, error)
 func (p *Parser) ParseReader(r io.Reader, systemID string) (*xsd.SchemaSet, error)
 ```
 
-### 2.2 Import/Include Resolution (`parser/resolve.go`)
+### 2.2 Import/Include Resolution (Deep Dive)
 
-- Resolve `xs:import` (different namespace, requires schemaLocation or catalog)
-- Resolve `xs:include` (same namespace, textual inclusion)
-- Resolve `xs:redefine` (include with modifications)
-- Handle circular imports via visited set
-- Resolve all `ref` and `type` attributes to model pointers
+Schema composition is critical for real-world XSD usage. Three mechanisms exist:
 
-### 2.3 Parser Hooks (`parser/hooks.go`)
+#### `xs:import` — Cross-Namespace References (`parser/import.go`)
+
+```xml
+<!-- main.xsd -->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:addr="http://example.com/address"
+           targetNamespace="http://example.com/order">
+  <xs:import namespace="http://example.com/address"
+             schemaLocation="address.xsd"/>
+  <xs:element name="shipTo" type="addr:AddressType"/>
+</xs:schema>
+```
+
+**Requirements:**
+- Import loads a schema from a different namespace
+- `schemaLocation` is a *hint*, not a mandate — support catalog override
+- Multiple imports of the same namespace are allowed (merged)
+- If `schemaLocation` is absent, type must be resolved via catalog or pre-loaded schemas
+- Circular imports across namespaces must be detected and handled
+
+```go
+type ImportResolver interface {
+    // Resolve returns the schema content for the given namespace + location hint.
+    // Default implementation reads from filesystem relative to the importing schema.
+    Resolve(namespace, schemaLocation, baseURI string) (io.ReadCloser, error)
+}
+
+// Built-in resolvers:
+type FileResolver struct{}     // Filesystem (relative/absolute paths)
+type HTTPResolver struct{}     // HTTP/HTTPS fetch (with caching)
+type CatalogResolver struct{}  // XML Catalog (OASIS) lookup
+type CompositeResolver struct{} // Chain of resolvers (try each in order)
+```
+
+#### `xs:include` — Same-Namespace Composition (`parser/include.go`)
+
+```xml
+<!-- types.xsd has same targetNamespace or no targetNamespace (chameleon) -->
+<xs:include schemaLocation="types.xsd"/>
+```
+
+**Requirements:**
+- Include merges declarations into the including schema's namespace
+- **Chameleon include**: if the included schema has no `targetNamespace`, it adopts the includer's namespace
+- Duplicate definitions after include must be detected (same name = error unless identical)
+- Circular includes detected via visited set (keyed by resolved URI)
+
+#### `xs:redefine` — Include with Modifications
+
+```xml
+<xs:redefine schemaLocation="base-types.xsd">
+  <xs:complexType name="AddressType">
+    <xs:complexContent>
+      <xs:extension base="AddressType">  <!-- self-reference = original -->
+        <xs:sequence>
+          <xs:element name="country" type="xs:string"/>
+        </xs:sequence>
+      </xs:extension>
+    </xs:complexContent>
+  </xs:complexType>
+</xs:redefine>
+```
+
+**Requirements:**
+- Like include, but allows redefining types/groups in the included schema
+- Self-referencing base type in redefine refers to the *original* definition
+- Deprecated in XSD 1.1 in favor of `xs:override`, but still must be supported
+
+#### `xs:override` (XSD 1.1) — Replacement for Redefine
+
+```xml
+<xs:override schemaLocation="base-types.xsd">
+  <xs:complexType name="AddressType">
+    <!-- Completely replaces the original definition -->
+  </xs:complexType>
+</xs:override>
+```
+
+#### Schema Resolution Order
+
+```
+1. Check pre-loaded schemas (programmatic API)
+2. Check XML Catalog (if configured)
+3. Try schemaLocation hint (relative to importing schema's base URI)
+4. Try well-known locations (e.g., xs namespace → built-in)
+5. Call custom ImportResolver hook
+6. Error: cannot resolve
+```
+
+#### Import/Include Test Fixtures
+
+```
+testdata/imports/
+├── simple_import/
+│   ├── main.xsd              # imports types.xsd
+│   └── types.xsd             # separate namespace
+├── chameleon_include/
+│   ├── main.xsd              # includes no-ns.xsd
+│   └── no_ns.xsd             # no targetNamespace
+├── circular_import/
+│   ├── a.xsd                 # imports b.xsd
+│   └── b.xsd                 # imports a.xsd
+├── diamond_import/
+│   ├── main.xsd              # imports left.xsd, right.xsd
+│   ├── left.xsd              # imports common.xsd
+│   ├── right.xsd             # imports common.xsd
+│   └── common.xsd            # shared types
+├── redefine/
+│   ├── main.xsd              # redefines base
+│   └── base.xsd              # original types
+├── override/                  # XSD 1.1
+│   ├── main.xsd
+│   └── base.xsd
+├── multi_ns/
+│   ├── orders.xsd            # ns: orders
+│   ├── products.xsd          # ns: products
+│   ├── customers.xsd         # ns: customers
+│   └── main.xsd              # imports all three
+└── catalog/
+    ├── catalog.xml            # OASIS XML Catalog
+    └── main.xsd              # uses catalog for resolution
+```
+
+### 2.3 Streaming Parser (`parser/streaming.go`)
+
+For large schemas or when you only need partial information, the streaming parser
+provides SAX-style event callbacks without building the full model in memory.
+
+```go
+package parser
+
+// Event types emitted by the streaming parser.
+type EventKind int
+
+const (
+    EventSchemaStart EventKind = iota
+    EventSchemaEnd
+    EventElementStart
+    EventElementEnd
+    EventComplexTypeStart
+    EventComplexTypeEnd
+    EventSimpleTypeStart
+    EventSimpleTypeEnd
+    EventSequenceStart
+    EventSequenceEnd
+    EventChoiceStart
+    EventChoiceEnd
+    EventAllStart
+    EventAllEnd
+    EventAttribute
+    EventImport
+    EventInclude
+    EventAnnotation
+    EventFacet
+    EventGroup
+    EventAttributeGroup
+)
+
+// Event is emitted during streaming parse.
+type Event struct {
+    Kind       EventKind
+    Name       string
+    Namespace  string
+    Attributes map[string]string
+    Depth      int    // Nesting depth
+    Location   Location // File + line/col
+}
+
+// StreamHandler receives events during streaming parse.
+type StreamHandler interface {
+    OnEvent(event Event) error
+    // OnError is called for non-fatal parse issues (e.g., unresolved ref in streaming mode).
+    OnError(err error) error
+}
+
+// StreamParser parses XSD without building full model.
+type StreamParser struct {
+    opts    Options
+    handler StreamHandler
+}
+
+func NewStreamParser(handler StreamHandler, opts ...Option) *StreamParser
+
+// Stream parses and emits events. Does NOT resolve references (no two-pass).
+func (sp *StreamParser) Stream(r io.Reader, systemID string) error
+
+// StreamFile is a convenience for file-based streaming.
+func (sp *StreamParser) StreamFile(path string) error
+```
+
+**Use cases:**
+- Schema introspection (list all types/elements without full parse)
+- IDE tooling (autocomplete, hover info)
+- Schema validation pre-flight (check syntax without full resolution)
+- Custom schema analysis tools via plugins
+- Processing schemas too large to fit in memory
+
+**Streaming + DOM interop:**
+```go
+// CollectingHandler builds a full model from stream events (bridges stream → DOM).
+type CollectingHandler struct { ... }
+
+// FilteringHandler wraps another handler and only forwards matching events.
+type FilteringHandler struct {
+    Inner     StreamHandler
+    KindFilter map[EventKind]bool
+}
+```
+
+### 2.4 Parser Hooks (`parser/hooks.go`)
 
 ```go
 // Hook allows plugins to intercept and modify parsing.
@@ -273,21 +810,57 @@ type Hook interface {
 
 **Incremental test fixtures** (each builds on the previous):
 
+#### Basic Parsing
 1. `testdata/basic/simple_element.xsd` — single element with built-in type
 2. `testdata/basic/simple_type.xsd` — simpleType with restriction (enum, pattern)
 3. `testdata/basic/complex_type.xsd` — complexType with sequence of elements
 4. `testdata/basic/attributes.xsd` — elements with attributes
-5. `testdata/choice/basic_choice.xsd` — complexType with choice
-6. `testdata/choice/nested_choice.xsd` — choice inside sequence, sequence inside choice
-7. `testdata/complex/extension.xsd` — type extension (inheritance)
-8. `testdata/complex/restriction.xsd` — type restriction
-9. `testdata/complex/group.xsd` — model groups and attribute groups
-10. `testdata/complex/any.xsd` — xs:any and xs:anyAttribute
-11. `testdata/complex/substitution.xsd` — substitution groups
-12. `testdata/imports/main.xsd` + `testdata/imports/types.xsd` — import/include
-13. `testdata/xsd11/assert.xsd` — assertions
-14. `testdata/xsd11/alternative.xsd` — conditional type assignment
-15. `testdata/xsd11/open_content.xsd` — open content model
+
+#### Built-in Types (Strong Coverage)
+5. `testdata/builtin/all_primitives.xsd` — elements using every primitive type
+6. `testdata/builtin/all_derived.xsd` — elements using every derived type
+7. `testdata/builtin/restrict_string.xsd` — custom type restricting string with pattern + maxLength
+8. `testdata/builtin/restrict_integer.xsd` — custom type restricting integer with min/max
+9. `testdata/builtin/restrict_decimal.xsd` — custom type with totalDigits + fractionDigits
+10. `testdata/builtin/invalid_facet.xsd` — applying totalDigits to string (must error)
+11. `testdata/builtin/chained_restriction.xsd` — type A restricts string, type B restricts A
+12. `testdata/builtin/list_type.xsd` — simpleType list
+13. `testdata/builtin/union_type.xsd` — simpleType union
+14. `testdata/builtin/xsd11_types.xsd` — yearMonthDuration, dayTimeDuration, dateTimeStamp
+
+#### Choice & Nested Compositors
+15. `testdata/choice/basic_choice.xsd` — complexType with choice
+16. `testdata/choice/nested_choice.xsd` — choice inside sequence, sequence inside choice
+17. `testdata/nested/choice_in_choice.xsd` — choice containing another choice
+18. `testdata/nested/sequence_in_all.xsd` — sequence inside all (XSD 1.1)
+19. `testdata/nested/deep_nesting.xsd` — 4+ levels: sequence > choice > sequence > choice
+20. `testdata/nested/mixed_compositors.xsd` — all three compositors in one type
+
+#### Type Derivation
+21. `testdata/derivation/simple_restriction.xsd` — simpleType restricts built-in
+22. `testdata/derivation/complex_extension.xsd` — complexType extends base type
+23. `testdata/derivation/complex_restriction.xsd` — complexType restricts base type
+24. `testdata/derivation/multi_level.xsd` — A extends B extends C
+25. `testdata/derivation/abstract_base.xsd` — abstract type with concrete subtypes
+26. `testdata/derivation/mixed_content_extension.xsd` — mixed content + extension
+
+#### Advanced Features
+27. `testdata/complex/group.xsd` — model groups and attribute groups
+28. `testdata/complex/any.xsd` — xs:any and xs:anyAttribute
+29. `testdata/complex/substitution.xsd` — substitution groups
+
+#### Import/Include (see section 2.2 for fixture details)
+30-38. All fixtures in `testdata/imports/` (simple, chameleon, circular, diamond, redefine, override, multi-ns, catalog)
+
+#### XSD 1.1
+39. `testdata/xsd11/assert.xsd` — assertions
+40. `testdata/xsd11/alternative.xsd` — conditional type assignment
+41. `testdata/xsd11/open_content.xsd` — open content model
+
+#### Streaming Parser
+42. `testdata/streaming/large_schema.xsd` — schema with 100+ types (event count test)
+43. `testdata/streaming/filter_test.xsd` — verify filtering handler
+44. `testdata/streaming/stream_vs_dom.xsd` — parse both ways, verify same types/elements found
 
 Each test: parse XSD → assert model structure matches expectations.
 
@@ -547,90 +1120,129 @@ goxsd3 generate \
 
 ## Implementation Order (Build Small → Outward)
 
-### Sprint 1: Foundation
+### Sprint 1: Foundation + Built-in Type Registry
 - [ ] `go.mod` init
-- [ ] `xsd/` — Core model types (Element, Attribute, SimpleType, ComplexType, Sequence, Choice, All)
-- [ ] `xsd/` — QName, TypeRef helpers
-- [ ] Unit tests for model construction
+- [ ] `xsd/` — QName, TypeRef, Namespace helpers
+- [ ] `xsd/builtin.go` — Built-in type registry with all 49 types, hfp: facet definitions
+- [ ] `xsd/facets.go` — Facet kinds, applicability table, inheritance rules
+- [ ] `xsd/builtin_test.go` — All 19 built-in type test functions (see Phase 0.6)
+- [ ] Verify: every built-in type present, hierarchy correct, facet applicability matches spec
 
-### Sprint 2: Basic Parser
-- [ ] `parser/` — Parse single XSD file with simple elements and built-in types
-- [ ] Test: `simple_element.xsd`
-- [ ] Add simpleType parsing (restriction with enum, pattern)
-- [ ] Test: `simple_type.xsd`
-- [ ] Add complexType with sequence
-- [ ] Test: `complex_type.xsd`
-- [ ] Add attribute parsing
-- [ ] Test: `attributes.xsd`
+### Sprint 2: Core Model Types
+- [ ] `xsd/model.go` — Schema, Element, Attribute, Import, Include, Annotation
+- [ ] `xsd/types.go` — Type interface, SimpleType (restriction/list/union), ComplexType
+- [ ] `xsd/compositor.go` — Compositor interface, Sequence, Choice, All, Particle interface
+- [ ] `xsd/constraint.go` — Restriction, Facet, Assertion
+- [ ] Unit tests for model construction and traversal
 
-### Sprint 3: Choice & Compositors
-- [ ] Parse `xs:choice`
-- [ ] Parse nested compositors (choice in sequence, sequence in choice)
-- [ ] Tests: `basic_choice.xsd`, `nested_choice.xsd`
+### Sprint 3: Basic Parser
+- [ ] `parser/parser.go` — Parse single XSD file, two-pass architecture
+- [ ] Parse simple elements with built-in types → test: `simple_element.xsd`
+- [ ] Parse simpleType (restriction with enum, pattern) → test: `simple_type.xsd`
+- [ ] Parse complexType with sequence → test: `complex_type.xsd`
+- [ ] Parse attributes → test: `attributes.xsd`
+- [ ] Built-in type resolution: all 49 types parseable → tests: `all_primitives.xsd`, `all_derived.xsd`
 
-### Sprint 4: Advanced Type Features
-- [ ] Type extension/restriction
+### Sprint 4: Type Derivation & Facets
+- [ ] SimpleType restriction with facet validation (check facet applicability via registry)
+- [ ] Tests: `restrict_string.xsd`, `restrict_integer.xsd`, `restrict_decimal.xsd`
+- [ ] Invalid facet application detection → test: `invalid_facet.xsd`
+- [ ] Chained restriction (A restricts B restricts built-in) → test: `chained_restriction.xsd`
+- [ ] SimpleType list and union → tests: `list_type.xsd`, `union_type.xsd`
+- [ ] ComplexType extension (complexContent + extension) → test: `complex_extension.xsd`
+- [ ] ComplexType restriction (complexContent + restriction) → test: `complex_restriction.xsd`
+- [ ] Multi-level inheritance (A extends B extends C) → test: `multi_level.xsd`
+- [ ] Abstract types with concrete subtypes → test: `abstract_base.xsd`
+
+### Sprint 5: Choice & Nested Compositors
+- [ ] Parse `xs:choice` → test: `basic_choice.xsd`
+- [ ] Parse nested compositors:
+  - [ ] Choice inside sequence → test: `nested_choice.xsd`
+  - [ ] Sequence inside choice
+  - [ ] Choice inside choice → test: `choice_in_choice.xsd`
+  - [ ] Deep nesting (4+ levels) → test: `deep_nesting.xsd`
+  - [ ] Mixed compositors → test: `mixed_compositors.xsd`
+- [ ] `xs:all` with maxOccurs > 1 (XSD 1.1) → test: `sequence_in_all.xsd`
+
+### Sprint 6: Advanced Features
 - [ ] Model groups (`xs:group`) and attribute groups
 - [ ] `xs:any` and `xs:anyAttribute`
 - [ ] Substitution groups
 - [ ] Tests for each
 
-### Sprint 5: Schema Composition
-- [ ] `xs:import` and `xs:include` resolution
-- [ ] Circular import handling
-- [ ] `xs:redefine`
-- [ ] Multi-file tests
+### Sprint 7: Import, Include & Schema Composition
+- [ ] `parser/import.go` — xs:import handler with ImportResolver interface
+- [ ] `parser/include.go` — xs:include handler with chameleon namespace support
+- [ ] FileResolver (relative paths from importing schema)
+- [ ] Circular import/include detection (visited set by resolved URI)
+- [ ] Tests: `simple_import/`, `chameleon_include/`, `circular_import/`, `diamond_import/`
+- [ ] `xs:redefine` with self-referencing base → test: `redefine/`
+- [ ] `xs:override` (XSD 1.1) → test: `override/`
+- [ ] Multi-namespace composition → test: `multi_ns/`
+- [ ] `parser/catalog.go` — OASIS XML Catalog support → test: `catalog/`
+- [ ] HTTPResolver (fetch remote schemas with caching)
+- [ ] CompositeResolver (chain of resolvers)
 
-### Sprint 6: Basic Code Generation
-- [ ] Type mapping (XSD built-in → Go)
+### Sprint 8: Streaming Parser
+- [ ] `parser/streaming.go` — Event types, StreamHandler interface
+- [ ] StreamParser implementation using `encoding/xml` token reader
+- [ ] FilteringHandler (only forward matching event kinds)
+- [ ] CollectingHandler (bridge stream → DOM model)
+- [ ] Tests: `large_schema.xsd` event counts, `filter_test.xsd`, `stream_vs_dom.xsd`
+
+### Sprint 9: Basic Code Generation
+- [ ] Type mapping (XSD built-in → Go, using BuiltinRegistry.GoType)
 - [ ] Struct generation from complexType + sequence
 - [ ] Pointer/slice for optional/repeated
+- [ ] User-defined simpleType → named Go type with validation
 - [ ] `go/format` integration
 - [ ] Golden file tests
 
-### Sprint 7: Choice Code Generation
+### Sprint 10: Choice Code Generation
 - [ ] Interface + concrete types for `xs:choice`
 - [ ] Type switch marshal/unmarshal generation
-- [ ] Nested choice handling
+- [ ] Nested choice → nested interfaces / flattened where possible
+- [ ] Sequence-in-choice → struct variant
+- [ ] Choice-in-sequence → interface field
 - [ ] Tests with compilation check
 
-### Sprint 8: Full Codegen
+### Sprint 11: Full Codegen
 - [ ] Enum generation (typed string constants)
-- [ ] Extension → embedded struct
+- [ ] Extension → embedded struct (ComplexType inheritance)
 - [ ] Group inlining
 - [ ] Any → `interface{}` / `xml.Token`
 - [ ] Golden file tests for all
 
-### Sprint 9: XML Marshallers
+### Sprint 12: XML Marshallers
 - [ ] Generate `MarshalXML` / `UnmarshalXML`
 - [ ] Choice type switch in marshaller
 - [ ] Namespace handling
 - [ ] Round-trip tests
 
-### Sprint 10: JSON Marshallers
+### Sprint 13: JSON Marshallers
 - [ ] Generate `MarshalJSON` / `UnmarshalJSON`
 - [ ] Discriminated union for choice types
 - [ ] Round-trip tests
 
-### Sprint 11: BER Marshallers
+### Sprint 14: BER Marshallers
 - [ ] ASN.1 type mapping
 - [ ] Generate BER marshal/unmarshal
 - [ ] Round-trip tests
 
-### Sprint 12: XSD 1.1 Features
+### Sprint 15: XSD 1.1 Features
 - [ ] Assertions (`xs:assert`) — store in model, optionally generate validation
 - [ ] Conditional type assignment (`xs:alternative`)
 - [ ] Open content (`xs:openContent`)
 - [ ] Enhanced wildcards
 - [ ] Tests for each
 
-### Sprint 13: Plugin System
+### Sprint 16: Plugin System
 - [ ] Hook interfaces finalized
 - [ ] Plugin registry
 - [ ] Sample plugins (rename, custom tags, validation)
 - [ ] Plugin tests
 
-### Sprint 14: CLI & Polish
+### Sprint 17: CLI & Polish
 - [ ] CLI with flag parsing
 - [ ] End-to-end integration tests
 - [ ] Error messages and diagnostics
