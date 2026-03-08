@@ -2068,7 +2068,7 @@ goxsd3 generate \
 
 ---
 
-## Implementation Order (Streaming-First, Build Outward)
+## Implementation Order (Build Outward from Core)
 
 ### Sprint 1: Foundation + Built-in Type Registry
 - [ ] `go.mod` init (require Go 1.21+ for `log/slog`)
@@ -2080,17 +2080,21 @@ goxsd3 generate \
 - [ ] Facet cross-validation tests (minLength > maxLength, etc.)
 - [ ] Verify: every built-in type present, hierarchy correct, facet applicability matches spec
 
-### Sprint 2: Core Model Types
-- [ ] `xsd/model.go` — Schema, Element, Attribute, Import, Include, Annotation
+### Sprint 2: Core Model Types + Foundational Infrastructure
+- [ ] `xsd/model.go` — SchemaSet, Schema, Element, Attribute, Import, Include, Annotation
 - [ ] `xsd/types.go` — Type interface, SimpleType (restriction/list/union), ComplexType
 - [ ] `xsd/compositor.go` — Compositor interface, Sequence, Choice, All, Particle interface
 - [ ] `xsd/constraint.go` — Restriction, Facet, Assertion
-- [ ] Unit tests for model construction and traversal
+- [ ] `xsd/orderedmap.go` — `OrderedMap[K, V]` generic type for stable iteration + O(1) lookup
+- [ ] `config/validation.go` — ValidationConfig, ValidationLevel, ValidationRule types
+- [ ] `parser/resolve.go` — `SchemaResolver` interface (location + baseURI + namespace → []byte)
+- [ ] Determinism rules established: all slices document-order, maps lookup-only, never iterated
+- [ ] Unit tests for model construction, traversal, and OrderedMap
 
-### Sprint 3: LocatingReader & Parser Foundation
+### Sprint 3: LocatingReader & Parser Foundation (Single Document)
 - [ ] `parser/locate.go` — LocatingReader wrapping io.Reader with line/col tracking
 - [ ] LocatingReader tests: verify line/col for various byte offsets, multi-byte UTF-8
-- [ ] `parser/parser.go` — Parser struct, New(), Parse(), ParseReader()
+- [ ] `parser/parser.go` — Parser struct, New(), Parse(), ParseReader(), parseOne()
 - [ ] xml.Decoder token loop with switch on StartElement/EndElement
 - [ ] `slog` integration — structured logging for parse events
 - [ ] Parse simple elements → build xsd.Element → test: `simple_element.xsd`
@@ -2099,35 +2103,32 @@ goxsd3 generate \
 - [ ] Parse attributes → build xsd.Attribute → test: `attributes.xsd`
 - [ ] Error messages include file:line:col from LocatingReader
 - [ ] Tests: location accuracy, parse all 49 built-in types
+- [ ] Single-document only — xs:import/xs:include recorded but not followed
 
-### Sprint 4: Symbol Table & Reference Resolution
+### Sprint 4: Symbol Table, Reference Resolution & Type Derivation
 - [ ] SymbolTable: add types as they're parsed, O(1) lookup by QName
 - [ ] Incremental resolution: wire up type refs eagerly when definition already seen
 - [ ] Forward reference resolution (pendingRefs list, resolved after token loop)
-- [ ] `parser/resolve.go` — cross-schema type resolution
-- [ ] Import handling: synchronous recursive parse via SchemaResolver
-- [ ] Include handling: same-namespace merge
-- [ ] Visited set to prevent circular imports
+- [ ] SimpleType restriction — parse `base`, wire up to parent type
+- [ ] SimpleType list and union → tests: `list_type.xsd`, `union_type.xsd`
+- [ ] ComplexType extension (complexContent + extension) → test: `complex_extension.xsd`
+- [ ] ComplexType restriction (complexContent + restriction) → test: `complex_restriction.xsd`
+- [ ] Chained restriction (A restricts B restricts built-in) → test: `chained_restriction.xsd`
+- [ ] Multi-level inheritance (A extends B extends C) → test: `multi_level.xsd`
+- [ ] Abstract types with concrete subtypes → test: `abstract_base.xsd`
 - [ ] Tests: `incremental_refs.xsd` — forward/backward refs resolved correctly
-- [ ] Tests: `large_schema.xsd` — 100+ types all parsed and resolved
 
-### Sprint 5: Type Derivation, Facets & Validation
-- [ ] `config/validation.go` — ValidationConfig, ValidationLevel, ValidationRule types
+### Sprint 5: Facet Validation & Schema-Parsing Strictness
 - [ ] Schema-parsing strictness: integrate ValidationConfig into parser Options
 - [ ] SimpleType restriction with facet validation (check facet applicability via registry)
 - [ ] Facet cross-validation (minLength ≤ maxLength, minInclusive ≤ maxInclusive, etc.)
 - [ ] Default/fixed value validation against declared types
+- [ ] Facet narrowing checks: derived type must not widen base facets
 - [ ] All schema validation respects per-rule strictness (error/warn/off)
 - [ ] Tests: `restrict_string.xsd`, `restrict_integer.xsd`, `restrict_decimal.xsd`
 - [ ] Invalid facet application detection → test: `invalid_facet.xsd`
 - [ ] Facet cross-validation tests → test: `invalid_facet_combo.xsd`
 - [ ] Default value validation tests → test: `invalid_defaults.xsd`
-- [ ] Chained restriction (A restricts B restricts built-in) → test: `chained_restriction.xsd`
-- [ ] SimpleType list and union → tests: `list_type.xsd`, `union_type.xsd`
-- [ ] ComplexType extension (complexContent + extension) → test: `complex_extension.xsd`
-- [ ] ComplexType restriction (complexContent + restriction) → test: `complex_restriction.xsd`
-- [ ] Multi-level inheritance (A extends B extends C) → test: `multi_level.xsd`
-- [ ] Abstract types with concrete subtypes → test: `abstract_base.xsd`
 
 ### Sprint 6: Choice & Nested Compositors
 - [ ] Parse `xs:choice` → test: `basic_choice.xsd`
@@ -2139,46 +2140,47 @@ goxsd3 generate \
   - [ ] Mixed compositors → test: `mixed_compositors.xsd`
 - [ ] `xs:all` with maxOccurs > 1 (XSD 1.1) → test: `sequence_in_all.xsd`
 
-### Sprint 7: Advanced Features
-- [ ] Model groups (`xs:group`) and attribute groups
-- [ ] `xs:any` and `xs:anyAttribute`
-- [ ] Substitution groups
-- [ ] Tests for each
-
-### Sprint 8: Import, Include & Schema Composition
-- [ ] `SchemaResolver` interface (location + baseURI + namespace → []byte)
-- [ ] `FileResolver` — resolve relative to importing schema's directory
-- [ ] `HTTPResolver` — fetch from HTTP/HTTPS with in-memory cache
-- [ ] `CatalogResolver` — OASIS XML Catalog lookup
-- [ ] `MultiResolver` — chain resolvers in order, first success wins
-- [ ] `parser/import.go` — xs:import via FollowImportsHandler (synchronous)
-- [ ] `parser/include.go` — xs:include handler with chameleon namespace support
-- [ ] Circular import/include detection (visited set by resolved URI)
-- [ ] Tests: `simple_import/`, `chameleon_include/`, `circular_import/`, `diamond_import/`
-- [ ] `xs:redefine` with self-referencing base → test: `redefine/`
-- [ ] `xs:override` (XSD 1.1) → test: `override/`
-- [ ] Multi-namespace composition → test: `multi_ns/`
-- [ ] `parser/catalog.go` — OASIS XML Catalog support → test: `catalog/`
-
-### Sprint 9: Public Test Suite Integration
-- [ ] Download W3C XSD Test Suite (XSTS) subset — focus on schema validation tests
-- [ ] Categorize XSTS tests by feature (types, facets, compositors, derivation, etc.)
-- [ ] Run XSTS positive tests (valid schemas) → parse succeeds
-- [ ] Run XSTS negative tests (invalid schemas) → parse correctly rejects
-- [ ] Track pass rate, document known failures
-- [ ] Download real-world schemas: SOAP 1.1/1.2, GPX 1.1, KML 2.2, XBRL, UBL, HL7 CDA
-- [ ] Parse each real-world schema without error
-- [ ] Verify type counts and element counts match expectations
-
-### Sprint 10: Contextual Naming System
+### Sprint 7: Contextual Naming System
 - [ ] `codegen/naming.go` — Namer, NameMap, conflict detection
 - [ ] Name derivation from element/attribute/group context path
 - [ ] Conflict resolution: qualify with parent, then grandparent, then numeric suffix
-- [ ] `OrderedMap[K, V]` generic type for stable iteration + O(1) lookup
 - [ ] Audit all map usage in parser/codegen: maps used for lookup only, never iterated
 - [ ] Determinism tests: parse same schema N times, verify identical name assignments
 - [ ] Naming edge case tests (see Phase 3.0.6)
 - [ ] Cross-namespace disambiguation tests
+
+### Sprint 8: Advanced Features
+- [ ] Model groups (`xs:group`) and attribute groups — parse + reference resolution
+- [ ] `xs:any` and `xs:anyAttribute`
+- [ ] Substitution groups
+- [ ] Tests for each
+
+### Sprint 9: Import, Include & Schema Composition
+- [ ] `parser/import.go` — xs:import handling via recursive parseOne() (synchronous)
+- [ ] `parser/include.go` — xs:include with chameleon namespace support
+- [ ] Circular import/include detection (visited set by resolved URI)
+- [ ] Cross-schema reference resolution in resolveAll() final pass
+- [ ] SchemaSet assembly — collect all parsed Schema objects in parse order
+- [ ] `FileResolver` — resolve relative to importing schema's directory
+- [ ] `HTTPResolver` — fetch from HTTP/HTTPS with in-memory cache
+- [ ] `CatalogResolver` — OASIS XML Catalog lookup
+- [ ] `MultiResolver` — chain resolvers in order, first success wins
+- [ ] `parser/catalog.go` — OASIS XML Catalog support → test: `catalog/`
+- [ ] Tests: `simple_import/`, `chameleon_include/`, `circular_import/`, `diamond_import/`
+- [ ] `xs:redefine` with self-referencing base → test: `redefine/`
+- [ ] `xs:override` (XSD 1.1) → test: `override/`
+- [ ] Multi-namespace composition → test: `multi_ns/`
+- [ ] Re-run naming determinism tests with multi-document schemas
+
+### Sprint 10: Public Test Suite Integration
+- [ ] Download W3C XSD Test Suite (XSTS) subset — focus on XSD 1.0 schema validation tests
+- [ ] Categorize XSTS tests by feature (types, facets, compositors, derivation, etc.)
+- [ ] Run XSTS positive tests (valid schemas) → parse succeeds
+- [ ] Run XSTS negative tests (invalid schemas) → parse correctly rejects
+- [ ] Track pass rate, document known failures (XSD 1.1 features expected to fail)
+- [ ] Download real-world schemas: SOAP 1.1/1.2, GPX 1.1, KML 2.2, XBRL, UBL, HL7 CDA
+- [ ] Parse each real-world schema without error
+- [ ] Verify type counts and element counts match expectations
 
 ### Sprint 11: Strict Type Library (`xsdtypes/`)
 - [ ] `xsdtypes/` package — strict wrapper types for built-in XSD types
@@ -2190,7 +2192,7 @@ goxsd3 generate \
 - [ ] Tests for each strict type: valid values, boundary values, invalid values
 
 ### Sprint 12: Basic Code Generation (Freeform Mode)
-- [ ] `codegen/naming.go` integrated — Namer runs before codegen
+- [ ] `codegen/codegen.go` — Generator struct, Namer runs before codegen
 - [ ] Type mapping (XSD built-in → Go, using BuiltinRegistry.GoType)
 - [ ] Struct generation from complexType + sequence
 - [ ] Anonymous type naming via Namer + NameMap
@@ -2243,6 +2245,7 @@ goxsd3 generate \
 - [ ] Conditional type assignment (`xs:alternative`)
 - [ ] Open content (`xs:openContent`)
 - [ ] Enhanced wildcards
+- [ ] Re-run XSTS with XSD 1.1 tests enabled
 - [ ] Tests for each
 
 ### Sprint 20: Plugin System
