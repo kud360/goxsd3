@@ -92,6 +92,9 @@ goxsd3/
 │   ├── json.go          # JSON marshal/unmarshal codegen
 │   ├── ber.go           # BER/ASN.1 marshal/unmarshal codegen
 │   └── hooks.go         # Marshal hook interfaces
+├── config/              # Config file loading
+│   ├── config.go        # Load/parse goxsd3.yaml
+│   └── validation.go    # ValidationConfig, ValidationLevel, ValidationRule
 ├── plugin/              # Plugin system
 │   ├── plugin.go        # Plugin interface & registry
 │   └── loader.go        # Plugin discovery/loading
@@ -752,11 +755,16 @@ All parser components use `log/slog` (Go 1.21+) for structured logging:
 ```go
 package parser
 
-// Options includes a logger. If nil, slog.Default() is used.
 type Options struct {
-    Logger   *slog.Logger
-    // ...
+    Logger           *slog.Logger       // If nil, slog.Default() is used
+    Resolver         SchemaResolver     // How to fetch imported/included schemas
+    SchemaStrictness ValidationConfig   // How strictly to validate the XSD itself
 }
+
+// Functional options:
+func WithLogger(l *slog.Logger) Option
+func WithResolver(r SchemaResolver) Option
+func WithSchemaStrictness(c ValidationConfig) Option
 
 // Usage throughout:
 // p.opts.Logger.Debug("resolving type reference", "ref", ref, "namespace", ns)
@@ -925,9 +933,12 @@ type MultiHandler struct {
 }
 
 // FollowImportsHandler automatically streams imported/included schemas.
+// When it receives EventImport/EventInclude, it calls the SchemaResolver to
+// get the bytes, creates a new StreamParser, and feeds the result to Inner.
+// Everything is synchronous — no goroutines.
 type FollowImportsHandler struct {
     Inner    StreamHandler
-    Resolver ImportResolver
+    Resolver SchemaResolver
     visited  map[string]bool // prevent circular follows
     logger   *slog.Logger
 }
@@ -961,13 +972,16 @@ func (p *Parser) ParseReader(r io.Reader, systemID string) (*xsd.SchemaSet, erro
 // func (p *Parser) Parse(files ...string) (*xsd.SchemaSet, error) {
 //     for _, file := range files {
 //         handler := NewCollectingHandler(p.registry, p.symbols, p.logger)
-//         followHandler := &FollowImportsHandler{Inner: handler, Resolver: p.resolver}
+//         followHandler := &FollowImportsHandler{
+//             Inner: handler, Resolver: p.resolver, // SchemaResolver
+//         }
 //         sp := NewStreamParser(followHandler, p.opts)
+//         // Everything is synchronous — no goroutines anywhere.
 //         if err := sp.StreamFile(file); err != nil { return nil, err }
 //         schema, err := handler.Schema()
 //         // ... add to schema set
 //     }
-//     // Final cross-schema resolution pass
+//     // Final cross-schema resolution pass (also synchronous)
 //     return p.resolveAll()
 // }
 ```
@@ -997,17 +1011,64 @@ Schema composition is critical for real-world XSD usage. Three mechanisms exist:
 - Circular imports across namespaces must be detected and handled
 
 ```go
-type ImportResolver interface {
-    // Resolve returns the schema content for the given namespace + location hint.
-    // Default implementation reads from filesystem relative to the importing schema.
-    Resolve(namespace, schemaLocation, baseURI string) (io.ReadCloser, error)
+// SchemaResolver resolves a schema location to its raw bytes.
+// The parser calls this when it encounters xs:import, xs:include, xs:redefine,
+// or xs:override. The user controls how schemas are fetched.
+//
+// Parameters:
+//   - location: the schemaLocation attribute value (relative or absolute path/URI)
+//   - baseURI:  the URI of the schema that contains the import/include directive
+//   - namespace: the target namespace (for xs:import; empty for xs:include)
+//
+// Returns the raw schema bytes. The parser handles all XML parsing internally.
+type SchemaResolver interface {
+    Resolve(location, baseURI, namespace string) ([]byte, error)
 }
 
-// Built-in resolvers:
-type FileResolver struct{}     // Filesystem (relative/absolute paths)
-type HTTPResolver struct{}     // HTTP/HTTPS fetch (with caching)
-type CatalogResolver struct{}  // XML Catalog (OASIS) lookup
-type CompositeResolver struct{} // Chain of resolvers (try each in order)
+// Pre-defined resolvers:
+
+// FileResolver resolves schema locations relative to the importing schema's
+// directory on the local filesystem.
+type FileResolver struct{}
+
+// HTTPResolver fetches schemas from HTTP/HTTPS URLs.
+// Includes an in-memory cache keyed by resolved URL.
+type HTTPResolver struct {
+    cache map[string][]byte
+}
+
+// CatalogResolver looks up schemas via an OASIS XML Catalog file.
+// Maps namespace URIs and system IDs to local file paths.
+type CatalogResolver struct {
+    catalogPath string
+    entries     map[string]string // namespace/systemID → local path
+}
+
+// MultiResolver tries multiple resolvers in order, returning the first success.
+type MultiResolver struct {
+    Resolvers []SchemaResolver
+}
+
+func (m *MultiResolver) Resolve(location, baseURI, namespace string) ([]byte, error) {
+    for _, r := range m.Resolvers {
+        data, err := r.Resolve(location, baseURI, namespace)
+        if err == nil {
+            return data, nil
+        }
+    }
+    return nil, fmt.Errorf("no resolver could resolve %q (base: %q, ns: %q)", location, baseURI, namespace)
+}
+
+// Example usage:
+// resolver := &MultiResolver{
+//     Resolvers: []SchemaResolver{
+//         &CatalogResolver{catalogPath: "catalog.xml"},
+//         &FileResolver{},
+//         &HTTPResolver{},
+//     },
+// }
+// p := parser.New(parser.WithResolver(resolver))
+// schemas, err := p.Parse("main.xsd")
 ```
 
 #### `xs:include` — Same-Namespace Composition (`parser/include.go`)
@@ -1056,13 +1117,18 @@ type CompositeResolver struct{} // Chain of resolvers (try each in order)
 
 #### Schema Resolution Order
 
+Resolution is handled entirely by the user-provided `SchemaResolver`. The
+`MultiResolver` chains resolvers in user-specified order:
+
 ```
-1. Check pre-loaded schemas (programmatic API)
-2. Check XML Catalog (if configured)
-3. Try schemaLocation hint (relative to importing schema's base URI)
-4. Try well-known locations (e.g., xs namespace → built-in)
-5. Call custom ImportResolver hook
-6. Error: cannot resolve
+Default MultiResolver order:
+1. CatalogResolver (if configured) — namespace/systemID → local file
+2. FileResolver — schemaLocation relative to importing schema's directory
+3. HTTPResolver — fetch from URL (if location is http/https)
+
+Special cases handled by the parser (before calling resolver):
+- xs namespace (http://www.w3.org/2001/XMLSchema) → built-in types (no I/O)
+- Already-loaded schemas (visited set) → skip (no I/O)
 ```
 
 #### Import/Include Test Fixtures
@@ -1307,29 +1373,30 @@ This is critical for:
 ```go
 // STABILITY RULES — enforced throughout parser, namer, and codegen:
 //
-// 1. NO map iteration for ordered output.
+// 1. NO CONCURRENCY. The entire library is single-threaded.
+//    No goroutines are used anywhere in parsing, naming, or codegen.
+//    This eliminates an entire class of non-determinism and makes the
+//    code simpler to reason about, debug, and test.
+//
+// 2. NO map iteration for ordered output.
 //    Maps are used for O(1) lookup only. When order matters, iterate
 //    over the source slice (which preserves document order) and look up
 //    in the map.
 //
-// 2. Document order is the canonical ordering.
+// 3. Document order is the canonical ordering.
 //    Elements, types, attributes, and compositors are stored in slices
 //    that preserve their order from the XSD source document. The streaming
 //    parser naturally produces events in document order.
 //
-// 3. Name assignment happens in a single deterministic pass.
+// 4. Name assignment happens in a single deterministic pass.
 //    Walk the schema in document order (depth-first). Assign names as
 //    encountered. First occurrence wins (no suffix). Later conflicts get
 //    qualified names or suffixes.
 //
-// 4. Import/include order is deterministic.
+// 5. Import/include order is deterministic.
 //    Imported schemas are processed in the order their <xs:import> elements
 //    appear in the importing schema. The FollowImportsHandler processes
-//    them in this order.
-//
-// 5. No goroutine-dependent ordering.
-//    Even if parsing uses concurrency internally, the output model must
-//    be assembled in a deterministic order.
+//    them synchronously in this order.
 //
 // 6. Cross-namespace naming uses namespace-prefixed disambiguation.
 //    If two namespaces both define "AddressType", they become
@@ -1544,19 +1611,26 @@ type FacetError struct {
 func (e *FacetError) Error() string
 ```
 
-### 3.1.1 Per-Rule Validation Strictness
+### 3.1.1 Two-Level Validation: Schema-Parsing vs Data-Parsing
 
-Users can configure validation strictness at the individual rule level, not just
-globally. This allows fine-grained control: e.g., enforce patterns but ignore
-length constraints, or warn instead of error on range violations.
+Validation strictness is configured at **two separate levels**, because the
+concerns are different:
+
+1. **Schema-parsing strictness** — how strictly to validate the XSD schema itself
+   during parsing (e.g., reject contradictory facets? reject invalid defaults?)
+2. **Data-parsing strictness** — how strictly the *generated code* validates
+   runtime data during marshal/unmarshal (e.g., enforce patterns? check ranges?)
+
+Both use the same `ValidationConfig` type, but are configured independently.
 
 ```go
 // ValidationConfig controls which validation rules are enforced.
+// Used for both schema-parsing and data-parsing strictness.
 type ValidationConfig struct {
     // Default behavior for all rules not explicitly configured.
     Default ValidationLevel
 
-    // Per-rule overrides. Key is the rule category.
+    // Per-rule overrides.
     Rules map[ValidationRule]ValidationLevel
 }
 
@@ -1569,6 +1643,7 @@ const (
 
 type ValidationRule int
 const (
+    // --- Facet rules (apply to both schema-parsing and data-parsing) ---
     RulePattern        ValidationRule = iota // regex pattern matching
     RuleEnumeration                          // value in enum set
     RuleMinLength                            // string/list minimum length
@@ -1581,27 +1656,184 @@ const (
     RuleFractionDigits                       // decimal fraction digits
     RuleWhiteSpace                           // whitespace normalization
     RuleLength                               // exact length
-    RuleDefaultValue                         // default value type-validity
-    RuleFixedValue                           // fixed value enforcement
-)
 
-// Example usage:
-opts := codegen.Options{
+    // --- Schema-parsing only rules ---
+    RuleDefaultValue        // default value type-validity
+    RuleFixedValue          // fixed value type-validity
+    RuleFacetCrossValidation // contradictory facets (minLength > maxLength)
+    RuleFacetNarrowing      // facet can only narrow, not widen
+    RuleFacetApplicability  // facet not applicable to base type
+    RuleDuplicateDefinition // duplicate type/element names after include
+    RuleCircularDerivation  // circular type derivation chains
+
+    // --- Data-parsing only rules ---
+    RuleRequiredElement     // required element missing during unmarshal
+    RuleRequiredAttribute   // required attribute missing during unmarshal
+    RuleUnknownElement      // unexpected element during unmarshal
+    RuleUnknownAttribute    // unexpected attribute during unmarshal
+)
+```
+
+#### Schema-Parsing Strictness
+
+Controls how the parser validates the XSD schema files themselves. Configured
+on `parser.Options`:
+
+```go
+package parser
+
+type Options struct {
+    Logger          *slog.Logger
+    Resolver        SchemaResolver
+    SchemaStrictness ValidationConfig  // how strictly to validate the schema
+}
+
+// Example: lenient parsing — accept schemas with contradictory facets
+p := parser.New(
+    parser.WithSchemaStrictness(ValidationConfig{
+        Default: ValidationError,
+        Rules: map[ValidationRule]ValidationLevel{
+            RuleFacetCrossValidation: ValidationWarn,  // warn but don't reject
+            RuleDefaultValue:         ValidationOff,   // don't validate defaults
+        },
+    }),
+)
+```
+
+**What schema-parsing strictness controls:**
+- `RuleFacetCrossValidation`: reject `minLength="10" maxLength="5"` or just warn?
+- `RuleFacetNarrowing`: reject derived type that widens a facet, or accept?
+- `RuleFacetApplicability`: reject `totalDigits` on `xs:string`, or ignore?
+- `RuleDefaultValue`: reject `default="abc"` on `xs:integer`, or accept?
+- `RuleFixedValue`: reject `fixed="green"` when enum is `{red, blue}`, or accept?
+- `RuleDuplicateDefinition`: reject duplicate names after include, or last-wins?
+- `RuleCircularDerivation`: reject circular type chains, or break the cycle?
+
+#### Data-Parsing Strictness
+
+Controls how the *generated code* validates runtime data during marshal/unmarshal.
+Configured on `codegen.Options`:
+
+```go
+package codegen
+
+type Options struct {
+    // ...
+    TypeMode        TypeMode
+    StrictTypes     map[string]bool
+    DataStrictness  ValidationConfig  // how strictly generated code validates data
+}
+
+// Example: strict data validation except patterns are just warnings
+g := codegen.New(codegen.Options{
     TypeMode: codegen.TypeModeStrict,
-    Validation: codegen.ValidationConfig{
-        Default: codegen.ValidationError,
-        Rules: map[codegen.ValidationRule]codegen.ValidationLevel{
-            codegen.RulePattern:    codegen.ValidationWarn,  // warn on pattern mismatch
-            codegen.RuleMaxLength:  codegen.ValidationOff,   // ignore maxLength
+    DataStrictness: ValidationConfig{
+        Default: ValidationError,
+        Rules: map[ValidationRule]ValidationLevel{
+            RulePattern:          ValidationWarn,  // warn on pattern mismatch
+            RuleUnknownElement:   ValidationOff,   // ignore unknown elements
         },
     },
-}
+})
 ```
+
+**What data-parsing strictness controls:**
+- `RulePattern`: generated `New*()` checks regex, returns error or warns?
+- `RuleMaxLength`: generated code enforces maxLength, or skips?
+- `RuleEnumeration`: generated code checks enum membership, or accepts any value?
+- `RuleRequiredElement`: generated unmarshal errors on missing required element?
+- `RuleUnknownElement`: generated unmarshal errors on unexpected element?
 
 **How validation levels affect generated code:**
 - `ValidationError`: generated `New*()` returns error, `Unmarshal*` returns error
 - `ValidationWarn`: generated code calls `slog.Warn()` but accepts the value
 - `ValidationOff`: no validation code generated for that rule (smaller binary)
+
+#### Config File Support (`goxsd3.yaml`)
+
+Both schema-parsing and data-parsing strictness can be configured via a YAML
+config file, allowing teams to share and version-control their validation rules.
+
+```yaml
+# goxsd3.yaml — validation configuration
+
+# Schema-parsing strictness: how strictly to validate XSD schema files
+schema_strictness:
+  default: error           # error | warn | off
+  rules:
+    facet_cross_validation: error    # reject contradictory facets
+    facet_narrowing: error           # reject widening restrictions
+    facet_applicability: error       # reject inapplicable facets
+    default_value: warn              # warn on invalid defaults, don't reject
+    fixed_value: warn                # warn on invalid fixed values
+    duplicate_definition: error      # reject duplicate names after include
+    circular_derivation: error       # reject circular type derivation
+
+# Data-parsing strictness: how strictly generated code validates runtime data
+data_strictness:
+  default: error
+  rules:
+    pattern: warn                    # warn on pattern mismatch, accept value
+    enumeration: error               # reject values not in enum set
+    min_length: error
+    max_length: error
+    min_inclusive: error
+    max_inclusive: error
+    min_exclusive: error
+    max_exclusive: error
+    total_digits: off                # don't generate totalDigits checks
+    fraction_digits: off             # don't generate fractionDigits checks
+    whitespace: off                  # don't generate whitespace normalization
+    length: error
+    required_element: error
+    required_attribute: error
+    unknown_element: warn            # warn on unknown elements, don't reject
+    unknown_attribute: off           # ignore unknown attributes entirely
+
+# Type generation mode
+type_mode: strict                    # freeform | strict | mixed
+strict_types:                        # only used when type_mode=mixed
+  - ZipCode
+  - Percentage
+  - PartCode
+
+# Code generation options
+codegen:
+  package: myschema
+  output_dir: ./generated
+  choice_style: typeswitch           # typeswitch | flat
+  generate_xml: true
+  generate_json: true
+  generate_ber: false
+```
+
+```go
+// Loading config file:
+package config
+
+// Load reads a goxsd3.yaml config file and returns parsed options.
+func Load(path string) (*Config, error)
+
+// Config holds all options from the config file.
+type Config struct {
+    SchemaStrictness ValidationConfig
+    DataStrictness   ValidationConfig
+    TypeMode         TypeMode
+    StrictTypes      []string
+    Codegen          CodegenConfig
+}
+
+// LoadValidationConfig reads just the validation section from a config file.
+// Useful when you only need validation rules (e.g., in a CI pipeline).
+func LoadValidationConfig(path string) (*ValidationConfig, *ValidationConfig, error)
+```
+
+**Config file resolution order:**
+1. Explicit `--config` flag on CLI
+2. `goxsd3.yaml` in current directory
+3. `goxsd3.yml` in current directory
+4. `$HOME/.config/goxsd3/config.yaml` (user-level defaults)
+5. Built-in defaults (all rules at `error` level)
 
 ### 3.2 Choice → Type Switch (Key Design Decision)
 
@@ -1812,26 +2044,33 @@ goxsd3 generate \
   --input schema.xsd \
   --output ./generated \
   --package myschema \
-  --xml \                      # generate XML marshallers (default)
-  --json \                     # generate JSON marshallers
-  --ber \                      # generate BER marshallers
-  --choice=typeswitch \        # choice strategy (typeswitch|flat)
-  --type-mode=freeform \       # freeform|strict|mixed
-  --strict-types="ZipCode,Percentage" \  # types to make strict (when --type-mode=mixed)
-  --validation=error \         # default validation level (error|warn|off)
-  --validation-rule="pattern:warn,maxLength:off" \  # per-rule overrides
-  --log-level=info \           # slog level (debug|info|warn|error)
-  --log-format=text            # slog format (text|json)
+  --config goxsd3.yaml \           # config file (optional, auto-detected)
+  --xml \                          # generate XML marshallers (default)
+  --json \                         # generate JSON marshallers
+  --ber \                          # generate BER marshallers
+  --choice=typeswitch \            # choice strategy (typeswitch|flat)
+  --type-mode=freeform \           # freeform|strict|mixed
+  --strict-types="ZipCode,Percentage" \  # types to make strict (mixed mode)
+  --schema-strictness=error \      # default schema-parsing strictness
+  --data-strictness=error \        # default data-parsing strictness
+  --log-level=info \               # slog level (debug|info|warn|error)
+  --log-format=text                # slog format (text|json)
+
+# CLI flags override config file values. Config file provides defaults.
+# Per-rule overrides are only available via config file (too verbose for CLI).
 ```
 
 ### Test Plan for Phase 6
 
 1. CLI parses flags correctly
-2. CLI reads XSD files and produces Go files
-3. `go build` succeeds on generated output
-4. Integration test: end-to-end from XSD to compiled Go with round-trip marshal
-5. Strict mode generates validated types, freeform generates plain types
-6. Mixed mode applies strict only to specified types
+2. Config file loading: explicit `--config`, auto-detect `goxsd3.yaml`, user-level
+3. CLI flags override config file values
+4. CLI reads XSD files and produces Go files
+5. `go build` succeeds on generated output
+6. Strict mode generates validated types, freeform generates plain types
+7. Mixed mode applies strict only to specified types
+8. Schema-parsing strictness: lenient mode accepts invalid schemas with warnings
+9. Data-parsing strictness: generated code respects per-rule levels
 
 ---
 
@@ -1877,9 +2116,12 @@ goxsd3 generate \
 - [ ] Tests: `large_schema.xsd` event counts, `filter_test.xsd`
 
 ### Sprint 5: Type Derivation, Facets & Validation
+- [ ] `config/validation.go` — ValidationConfig, ValidationLevel, ValidationRule types
+- [ ] Schema-parsing strictness: integrate ValidationConfig into parser Options
 - [ ] SimpleType restriction with facet validation (check facet applicability via registry)
 - [ ] Facet cross-validation (minLength ≤ maxLength, minInclusive ≤ maxInclusive, etc.)
 - [ ] Default/fixed value validation against declared types
+- [ ] All schema validation respects per-rule strictness (error/warn/off)
 - [ ] Tests: `restrict_string.xsd`, `restrict_integer.xsd`, `restrict_decimal.xsd`
 - [ ] Invalid facet application detection → test: `invalid_facet.xsd`
 - [ ] Facet cross-validation tests → test: `invalid_facet_combo.xsd`
@@ -1908,17 +2150,19 @@ goxsd3 generate \
 - [ ] Tests for each
 
 ### Sprint 8: Import, Include & Schema Composition
-- [ ] `parser/import.go` — xs:import via FollowImportsHandler (streaming-aware)
+- [ ] `SchemaResolver` interface (location + baseURI + namespace → []byte)
+- [ ] `FileResolver` — resolve relative to importing schema's directory
+- [ ] `HTTPResolver` — fetch from HTTP/HTTPS with in-memory cache
+- [ ] `CatalogResolver` — OASIS XML Catalog lookup
+- [ ] `MultiResolver` — chain resolvers in order, first success wins
+- [ ] `parser/import.go` — xs:import via FollowImportsHandler (synchronous)
 - [ ] `parser/include.go` — xs:include handler with chameleon namespace support
-- [ ] FileResolver (relative paths from importing schema)
 - [ ] Circular import/include detection (visited set by resolved URI)
 - [ ] Tests: `simple_import/`, `chameleon_include/`, `circular_import/`, `diamond_import/`
 - [ ] `xs:redefine` with self-referencing base → test: `redefine/`
 - [ ] `xs:override` (XSD 1.1) → test: `override/`
 - [ ] Multi-namespace composition → test: `multi_ns/`
 - [ ] `parser/catalog.go` — OASIS XML Catalog support → test: `catalog/`
-- [ ] HTTPResolver (fetch remote schemas with caching)
-- [ ] CompositeResolver (chain of resolvers)
 
 ### Sprint 9: Public Test Suite Integration
 - [ ] Download W3C XSD Test Suite (XSTS) subset — focus on schema validation tests
@@ -1962,7 +2206,7 @@ goxsd3 generate \
 ### Sprint 13: Strict Mode Code Generation
 - [ ] Generate strict wrapper types with New*/Must* constructors
 - [ ] Generate validation functions based on facets
-- [ ] Per-rule validation strictness in generated code
+- [ ] Data-parsing strictness: per-rule validation in generated code (error/warn/off)
 - [ ] TypeModeMixed: per-type strict/freeform selection
 - [ ] Golden file tests (strict mode variants)
 
@@ -2011,8 +2255,11 @@ goxsd3 generate \
 - [ ] Sample plugins (rename, custom tags, validation)
 - [ ] Plugin tests
 
-### Sprint 21: CLI & Polish
-- [ ] CLI with flag parsing (including `--type-mode`, `--validation`)
+### Sprint 21: Config File & CLI
+- [ ] `config/config.go` — Load/parse goxsd3.yaml
+- [ ] Config file auto-detection (cwd, then user-level)
+- [ ] CLI flags override config file values
+- [ ] CLI with flag parsing (`--config`, `--type-mode`, `--schema-strictness`, `--data-strictness`)
 - [ ] `slog` handler configuration via CLI (`--log-level`, `--log-format`)
 - [ ] End-to-end integration tests
 - [ ] Error messages and diagnostics
@@ -2037,26 +2284,44 @@ References are resolved eagerly when possible, with forward references collected
 resolved in a final pass. This means the DOM parser needs only one streaming pass
 plus a fast resolution sweep, not two full XML parses.
 
-### 4. Strict vs Freeform Types
+### 4. No Concurrency
+The entire library is single-threaded. No goroutines anywhere in parsing, naming,
+or codegen. This eliminates non-determinism and makes the code simpler to reason
+about. The `SchemaResolver` interface is synchronous: the parser calls it, blocks
+until bytes are returned, and continues.
+
+### 5. Strict vs Freeform Types
 Users choose between plain Go types (freeform, easy, no overhead) and validated
 wrapper types (strict, enforces XSD facets at the Go level). Mixed mode allows
-per-type selection. Validation strictness is configurable at the individual rule
-level (error/warn/off).
+per-type selection.
 
-### 5. Template-Based Codegen
+### 6. Two-Level Validation Strictness
+Schema-parsing strictness (how strictly to validate the XSD itself) and
+data-parsing strictness (how strictly generated code validates runtime data)
+are configured independently, both using the same `ValidationConfig` type.
+Per-rule granularity (error/warn/off) for each. Both can be set via a
+`goxsd3.yaml` config file or programmatic API.
+
+### 7. Simple Schema Resolution
+The `SchemaResolver` interface is minimal: `(location, baseURI, namespace) → []byte`.
+Users control how schemas are fetched. Pre-defined resolvers (`FileResolver`,
+`HTTPResolver`, `CatalogResolver`) are combined via `MultiResolver`. The parser
+never does I/O directly — all external access goes through the resolver.
+
+### 8. Template-Based Codegen
 Use `text/template` with `go/format` rather than AST construction. Templates are easier to read, modify, and debug. Plugins can modify the model before template rendering or post-process the output.
 
-### 6. Hooks at Every Phase
+### 9. Hooks at Every Phase
 Four hook points: Parser → Model → Codegen → Marshal. Each hook can modify, add, or reject. This allows plugins to:
 - Add custom struct tags during codegen
 - Override type mappings
 - Inject validation logic
 - Handle proprietary XSD extensions
 
-### 7. BER via Struct Tags
+### 10. BER via Struct Tags
 Generate ASN.1 struct tags on the same Go types, so a single struct can marshal to XML, JSON, and BER. Use `asn1:"..."` tags alongside `xml:"..."` and `json:"..."`.
 
-### 8. Deterministic Contextual Naming
+### 11. Deterministic Contextual Naming
 Anonymous types are named from their definition context (containing element/type path).
 Conflicts are resolved by qualifying with parent names, then numeric suffixes. All
 data structures preserve document order — maps are used for O(1) lookup only, never
@@ -2064,7 +2329,7 @@ iterated for output. The `OrderedMap[K,V]` generic type enforces this pattern.
 Determinism is tested: same schema parsed N times must produce identical name
 assignments.
 
-### 9. Structured Logging with slog
+### 12. Structured Logging with slog
 All components use `log/slog` for structured, leveled logging. Log groups
 (`parser.stream`, `parser.resolve`, `parser.import`, `parser.validate`)
 provide fine-grained control. The logger is injected via Options, defaulting
