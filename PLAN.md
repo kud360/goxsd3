@@ -12,27 +12,40 @@ A Go library and CLI tool that:
 
 ## Architecture Overview
 
+**Streaming-first**: The streaming parser is the foundation. The DOM parser is built
+on top of it via `CollectingHandler`. This ensures a single XML reading path and
+makes the streaming parser the most tested, most exercised code path.
+
 ```
                      ┌───────────────────┐
                      │  Built-in Types   │
                      │  (hfp: registry)  │
                      └────────┬──────────┘
                               │ bootstrap
-┌──────────────┐     ┌───────▼──────┐     ┌──────────────────┐     ┌──────────────┐
-│  XSD Files   │────▶│    Parser    │────▶│   Schema Model   │────▶│   CodeGen    │
-│  (.xsd)      │     │  (Phase 1)   │     │   (AST / IR)     │     │  (Phase 2)   │
-└──────────────┘     └──────────────┘     └──────────────────┘     └──────────────┘
-       │                   │                      │                       │
-  ┌────▼────┐        ┌─────▼─────┐          ┌─────▼─────┐          ┌─────▼──────┐
-  │ import/ │        │  Parser   │          │  Model    │          │  CodeGen   │
-  │ include │        │  Hooks    │          │  Hooks    │          │  Hooks     │
-  └─────────┘        └───────────┘          └───────────┘          └────────────┘
-                                                                        │
-                           ┌──────────────────────┐           ┌─────────┼─────────┐
-                           │  Streaming Parser     │           ▼         ▼         ▼
-                           │  (SAX-style events)   │        XML       JSON       BER
-                           └──────────────────────┘       Marshal   Marshal   Marshal
+┌──────────────┐     ┌───────▼──────────────────┐     ┌──────────────────┐
+│  XSD Files   │────▶│  Streaming Parser         │────▶│   Schema Model   │
+│  (.xsd)      │     │  (SAX-style events)       │     │   (AST / IR)     │
+└──────────────┘     │                            │     └────────┬─────────┘
+       │             │  ┌─ CollectingHandler ──┐  │              │
+  ┌────▼────┐        │  │  (builds full DOM)   │  │     ┌────────▼─────────┐
+  │ import/ │        │  └──────────────────────┘  │     │     CodeGen      │
+  │ include │        │  ┌─ TypeListHandler ────┐  │     └────────┬─────────┘
+  └─────────┘        │  │  (fast introspection)│  │              │
+                     │  └──────────────────────┘  │     ┌────────┼─────────┐
+                     │  ┌─ FilteringHandler ───┐  │     ▼        ▼         ▼
+                     │  │  (selective events)  │  │   XML      JSON      BER
+                     │  └──────────────────────┘  │  Marshal  Marshal  Marshal
+                     └────────────────────────────┘
+                              │
+                         ┌────▼─────┐
+                         │   slog   │  (structured logging throughout)
+                         └──────────┘
 ```
+
+**Key insight**: `parser.Parse()` internally creates a `StreamParser` + `CollectingHandler`,
+so the DOM parser is just a convenience wrapper. Users who need streaming get the same
+battle-tested tokenizer. The `CollectingHandler` connects references as type definitions
+are encountered during the stream, maintaining a symbol table that grows incrementally.
 
 ### Package Layout
 
@@ -47,18 +60,20 @@ goxsd3/
 │   ├── types.go         # Simple/complex type definitions
 │   ├── builtin.go       # Built-in type registry (hfp: definitions)
 │   ├── builtin_test.go  # Comprehensive built-in type tests
-│   ├── facets.go        # Facet definitions, applicability, inheritance
+│   ├── facets.go        # Facet definitions, applicability, cross-validation
+│   ├── validate.go      # Default/fixed value validation, facet narrowing checks
 │   ├── compositor.go    # Sequence, Choice, All (nested support)
 │   ├── constraint.go    # Facets, assertions, identity constraints
 │   └── namespace.go     # Namespace & import resolution
 ├── parser/              # XSD parser (XML → model)
-│   ├── parser.go        # Main parser (DOM-style, full schema load)
-│   ├── streaming.go     # Streaming parser (SAX-style event callbacks)
+│   ├── streaming.go     # Streaming parser (SAX-style event callbacks) — THE FOUNDATION
+│   ├── handler.go       # CollectingHandler (stream → DOM), FilteringHandler, etc.
+│   ├── parser.go        # DOM parser (convenience wrapper: StreamParser + CollectingHandler)
 │   ├── resolve.go       # Type/ref resolution, import/include/redefine
 │   ├── import.go        # xs:import handler (cross-namespace)
 │   ├── include.go       # xs:include handler (same-namespace)
 │   ├── catalog.go       # XML Catalog support for schema resolution
-│   ├── options.go       # Parser options
+│   ├── options.go       # Parser options (including slog.Logger)
 │   └── hooks.go         # Parser hook interfaces
 ├── codegen/             # Go code generation (model → Go source)
 │   ├── codegen.go       # Main code generator
@@ -88,7 +103,9 @@ goxsd3/
     ├── imports/         # import/include/redefine multi-file tests
     ├── nested/          # Deeply nested compositor tests
     ├── streaming/       # Streaming parser test fixtures
-    └── xsd11/
+    ├── xsd11/
+    ├── w3c/             # W3C XSD Test Suite (XSTS) subset
+    └── realworld/       # Real-world schemas (SOAP, GPX, KML, XBRL, etc.)
 ```
 
 ---
@@ -266,6 +283,145 @@ anyType                                    (ur-type, root of all types)
 - Facets marked `fixed="true"` cannot be overridden in further derivations
 - Union types only support: `pattern`, `enumeration`
 - List types only support: `length`, `minLength`, `maxLength`, `pattern`, `enumeration`, `whiteSpace`
+
+### 0.4.1 Facet Cross-Validation (`xsd/facets.go`)
+
+Related facets must be validated against each other. A schema that specifies
+contradictory facets is invalid and must be rejected at parse time.
+
+**Cross-validation rules:**
+```go
+// ValidateFacetSet checks that a set of facets is internally consistent.
+func ValidateFacetSet(facets []Facet, baseType QName) []error
+
+// Rules enforced:
+// 1. minLength ≤ maxLength (if both present)
+// 2. minInclusive ≤ maxInclusive (if both present)
+// 3. minExclusive < maxExclusive (if both present)
+// 4. minInclusive < maxExclusive (if both present) — cannot equal
+// 5. minExclusive < maxInclusive (if both present) — cannot equal
+// 6. If length is set, minLength and maxLength must not contradict it
+//    (length ≥ minLength, length ≤ maxLength, or don't set them)
+// 7. totalDigits ≥ fractionDigits (if both present)
+// 8. enumeration values must be valid for the base type
+//    (e.g., enum value "abc" on xs:integer is invalid)
+// 9. pattern must be a valid regex (compile-check at parse time)
+// 10. Fixed facets from base cannot be overridden
+// 11. Facets can only narrow, never widen:
+//     - New minLength ≥ inherited minLength
+//     - New maxLength ≤ inherited maxLength
+//     - New minInclusive ≥ inherited minInclusive
+//     - New maxInclusive ≤ inherited maxInclusive
+//     - etc.
+```
+
+**Example invalid schemas that MUST be rejected:**
+```xml
+<!-- minLength > maxLength -->
+<xs:simpleType name="Bad1">
+  <xs:restriction base="xs:string">
+    <xs:minLength value="10"/>
+    <xs:maxLength value="5"/>   <!-- ERROR -->
+  </xs:restriction>
+</xs:simpleType>
+
+<!-- minInclusive > maxInclusive -->
+<xs:simpleType name="Bad2">
+  <xs:restriction base="xs:integer">
+    <xs:minInclusive value="100"/>
+    <xs:maxInclusive value="50"/>  <!-- ERROR -->
+  </xs:restriction>
+</xs:simpleType>
+
+<!-- totalDigits < fractionDigits -->
+<xs:simpleType name="Bad3">
+  <xs:restriction base="xs:decimal">
+    <xs:totalDigits value="3"/>
+    <xs:fractionDigits value="5"/>  <!-- ERROR -->
+  </xs:restriction>
+</xs:simpleType>
+
+<!-- enum value invalid for base type -->
+<xs:simpleType name="Bad4">
+  <xs:restriction base="xs:integer">
+    <xs:enumeration value="abc"/>  <!-- ERROR: not an integer -->
+  </xs:restriction>
+</xs:simpleType>
+
+<!-- widens inherited facet -->
+<xs:simpleType name="Base">
+  <xs:restriction base="xs:string">
+    <xs:maxLength value="10"/>
+  </xs:restriction>
+</xs:simpleType>
+<xs:simpleType name="Bad5">
+  <xs:restriction base="Base">
+    <xs:maxLength value="20"/>  <!-- ERROR: widens maxLength -->
+  </xs:restriction>
+</xs:simpleType>
+```
+
+### 0.4.2 Default & Fixed Value Validation (`xsd/validate.go`)
+
+Element and attribute `default` and `fixed` values must be validated against
+their declared type at parse time. This catches schema authoring errors early.
+
+```go
+// ValidateDefaultValue checks that a default/fixed value is valid for the given type.
+func ValidateDefaultValue(value string, typeName QName, registry *BuiltinRegistry) error
+
+// Rules:
+// 1. Value must be in the type's value space (e.g., "abc" is not valid for xs:integer)
+// 2. Value must satisfy all facets of the type (pattern, enumeration, min/max, etc.)
+// 3. For derived types, walk the restriction chain and validate against each level
+// 4. For list types, validate each whitespace-separated item against the itemType
+// 5. For union types, value must be valid for at least one memberType
+```
+
+**Built-in type value parsers** (used for validation):
+```go
+// Each built-in type family needs a value parser for validation.
+type ValueValidator interface {
+    // Validate checks if the string is a valid lexical representation.
+    Validate(value string) error
+}
+
+// Built-in validators:
+// - StringValidator: always valid (any string)
+// - BooleanValidator: "true", "false", "1", "0"
+// - IntegerValidator: optional sign + digits (no decimal point)
+// - DecimalValidator: optional sign + digits + optional fractional part
+// - FloatValidator: decimal | "INF" | "-INF" | "NaN"
+// - DateTimeValidator: ISO 8601 format validation
+// - DateValidator, TimeValidator, etc.
+// - Base64Validator: valid base64 characters
+// - HexBinaryValidator: even number of hex characters
+// - AnyURIValidator: IRI validation (RFC 3987)
+// - QNameValidator: prefix:localName format
+```
+
+**Examples that must be caught:**
+```xml
+<!-- default value "abc" is not a valid integer -->
+<xs:element name="count" type="xs:integer" default="abc"/>  <!-- ERROR -->
+
+<!-- fixed value outside enumeration -->
+<xs:simpleType name="Color">
+  <xs:restriction base="xs:string">
+    <xs:enumeration value="red"/>
+    <xs:enumeration value="blue"/>
+  </xs:restriction>
+</xs:simpleType>
+<xs:element name="c" type="Color" fixed="green"/>  <!-- ERROR -->
+
+<!-- default value exceeds maxLength -->
+<xs:simpleType name="ShortName">
+  <xs:restriction base="xs:string">
+    <xs:maxLength value="3"/>
+  </xs:restriction>
+</xs:simpleType>
+<xs:element name="n" type="ShortName" default="Jonathan"/>  <!-- ERROR -->
+```
 
 ### 0.5 User-Defined Type Derivation
 
@@ -576,13 +732,201 @@ type Assertion struct { // XSD 1.1
 
 ## Phase 2: Parser (XSD XML → Model)
 
-### 2.1 Core Parser (`parser/parser.go`)
+**Streaming-first architecture**: The streaming parser (`parser/streaming.go`) is the
+foundation. The DOM parser (`parser/parser.go`) is a thin wrapper that feeds the stream
+into a `CollectingHandler` which builds the full model.
 
-Uses `encoding/xml` to parse XSD files into the model from Phase 1.
+### 2.0 Logging with `slog`
 
-**Strategy**: Parse in two passes:
-1. **Pass 1**: Parse all schema documents, collect all named types/elements/groups (symbol table)
-2. **Pass 2**: Resolve all references (`ref`, `type`, `base`, `substitutionGroup`)
+All parser components use `log/slog` (Go 1.21+) for structured logging:
+
+```go
+package parser
+
+// Options includes a logger. If nil, slog.Default() is used.
+type Options struct {
+    Logger   *slog.Logger
+    // ...
+}
+
+// Usage throughout:
+// p.opts.Logger.Debug("resolving type reference", "ref", ref, "namespace", ns)
+// p.opts.Logger.Info("parsed schema", "namespace", schema.TargetNamespace, "types", len(schema.Types))
+// p.opts.Logger.Warn("duplicate type definition", "name", name, "location", loc)
+// p.opts.Logger.Error("circular import detected", "chain", chain)
+```
+
+Log groups for structured context:
+- `parser.stream` — streaming parser events
+- `parser.resolve` — type/ref resolution
+- `parser.import` — import/include processing
+- `parser.validate` — facet/default validation
+
+### 2.1 Streaming Parser — THE FOUNDATION (`parser/streaming.go`)
+
+The streaming parser reads XSD using `encoding/xml` token-by-token and emits
+typed events. It is the single XML reading path — all other parsing builds on it.
+
+```go
+package parser
+
+// Event types emitted by the streaming parser.
+type EventKind int
+
+const (
+    EventSchemaStart EventKind = iota
+    EventSchemaEnd
+    EventElementStart
+    EventElementEnd
+    EventComplexTypeStart
+    EventComplexTypeEnd
+    EventSimpleTypeStart
+    EventSimpleTypeEnd
+    EventSequenceStart
+    EventSequenceEnd
+    EventChoiceStart
+    EventChoiceEnd
+    EventAllStart
+    EventAllEnd
+    EventAttribute
+    EventImport
+    EventInclude
+    EventRedefine        // xs:redefine
+    EventOverride        // xs:override (XSD 1.1)
+    EventAnnotation
+    EventFacet
+    EventGroup
+    EventGroupEnd
+    EventAttributeGroup
+    EventAttributeGroupEnd
+    EventRestriction
+    EventExtension
+    EventList
+    EventUnion
+)
+
+// Event is emitted during streaming parse.
+type Event struct {
+    Kind       EventKind
+    Name       string
+    Namespace  string
+    Attributes map[string]string // raw XML attributes
+    Depth      int               // nesting depth in XSD structure
+    Location   Location          // file + line/col
+}
+
+type Location struct {
+    SystemID string // file path or URI
+    Line     int
+    Col      int
+}
+
+// StreamHandler receives events during streaming parse.
+type StreamHandler interface {
+    OnEvent(event Event) error
+    OnError(err error) error
+}
+
+// StreamParser parses XSD token-by-token and emits events.
+type StreamParser struct {
+    opts    Options
+    handler StreamHandler
+    logger  *slog.Logger
+}
+
+func NewStreamParser(handler StreamHandler, opts ...Option) *StreamParser
+
+// Stream parses and emits events from an io.Reader.
+func (sp *StreamParser) Stream(r io.Reader, systemID string) error
+
+// StreamFile is a convenience for file-based streaming.
+func (sp *StreamParser) StreamFile(path string) error
+```
+
+### 2.1.1 CollectingHandler — Stream → DOM (`parser/handler.go`)
+
+The `CollectingHandler` builds the full schema model from stream events. It maintains
+an incremental symbol table so that type references can be connected as definitions
+are encountered during the stream.
+
+```go
+// CollectingHandler builds a full xsd.Schema from stream events.
+// This is the bridge between streaming and DOM parsing.
+type CollectingHandler struct {
+    schema   *xsd.Schema
+    registry *xsd.BuiltinRegistry
+    symbols  *SymbolTable
+    stack    []buildContext      // stack of in-progress constructs
+    logger   *slog.Logger
+
+    // Incremental reference resolution:
+    // As type definitions are seen, they're added to the symbol table.
+    // Forward references are collected and resolved in a final pass.
+    pendingRefs []pendingRef
+}
+
+type pendingRef struct {
+    ref      xsd.TypeRef
+    location Location
+    setter   func(xsd.Type) // callback to wire up the reference
+}
+
+// Schema returns the built model. Call after streaming completes.
+// Performs final reference resolution and validation.
+func (c *CollectingHandler) Schema() (*xsd.Schema, error)
+
+// OnEvent processes each stream event, building the model incrementally.
+func (c *CollectingHandler) OnEvent(event Event) error
+
+// OnError logs and optionally collects non-fatal errors.
+func (c *CollectingHandler) OnError(err error) error
+```
+
+**Incremental resolution strategy:**
+1. As `EventComplexTypeStart`/`EventSimpleTypeStart` events arrive, definitions
+   are added to the symbol table immediately
+2. When a `type="..."` or `base="..."` reference is encountered, check the symbol
+   table — if found, wire it up immediately; if not, add to `pendingRefs`
+3. After streaming completes, resolve all `pendingRefs` (forward references)
+4. Any remaining unresolved refs are errors (unless from imported namespaces
+   that haven't been loaded yet)
+
+### 2.1.2 Other Built-in Handlers
+
+```go
+// FilteringHandler wraps another handler and only forwards matching events.
+type FilteringHandler struct {
+    Inner      StreamHandler
+    KindFilter map[EventKind]bool
+}
+
+// TypeListHandler collects just type names (fast schema introspection).
+type TypeListHandler struct {
+    Types []xsd.QName
+}
+
+// ElementListHandler collects just global element names.
+type ElementListHandler struct {
+    Elements []xsd.QName
+}
+
+// MultiHandler fans out events to multiple handlers.
+type MultiHandler struct {
+    Handlers []StreamHandler
+}
+
+// FollowImportsHandler automatically streams imported/included schemas.
+type FollowImportsHandler struct {
+    Inner    StreamHandler
+    Resolver ImportResolver
+    visited  map[string]bool // prevent circular follows
+    logger   *slog.Logger
+}
+```
+
+### 2.2 DOM Parser — Convenience Wrapper (`parser/parser.go`)
+
+The DOM parser is a thin wrapper: StreamParser + CollectingHandler + resolution pass.
 
 ```go
 package parser
@@ -592,15 +936,31 @@ type Parser struct {
     hooks      []Hook
     schemas    map[string]*xsd.Schema // namespace → schema
     symbols    SymbolTable
+    logger     *slog.Logger
 }
 
 func New(opts ...Option) *Parser
 
 // Parse parses one or more XSD files and returns the resolved schema set.
+// Internally uses StreamParser + CollectingHandler.
 func (p *Parser) Parse(files ...string) (*xsd.SchemaSet, error)
 
 // ParseReader parses from an io.Reader.
 func (p *Parser) ParseReader(r io.Reader, systemID string) (*xsd.SchemaSet, error)
+
+// Parse implementation (pseudocode):
+// func (p *Parser) Parse(files ...string) (*xsd.SchemaSet, error) {
+//     for _, file := range files {
+//         handler := NewCollectingHandler(p.registry, p.symbols, p.logger)
+//         followHandler := &FollowImportsHandler{Inner: handler, Resolver: p.resolver}
+//         sp := NewStreamParser(followHandler, p.opts)
+//         if err := sp.StreamFile(file); err != nil { return nil, err }
+//         schema, err := handler.Schema()
+//         // ... add to schema set
+//     }
+//     // Final cross-schema resolution pass
+//     return p.resolveAll()
+// }
 ```
 
 ### 2.2 Import/Include Resolution (Deep Dive)
@@ -730,124 +1090,7 @@ testdata/imports/
     └── main.xsd              # uses catalog for resolution
 ```
 
-### 2.3 Streaming Parser (`parser/streaming.go`)
-
-For large schemas or when you only need partial information, the streaming parser
-provides SAX-style event callbacks without building the full model in memory.
-
-```go
-package parser
-
-// Event types emitted by the streaming parser.
-type EventKind int
-
-const (
-    EventSchemaStart EventKind = iota
-    EventSchemaEnd
-    EventElementStart
-    EventElementEnd
-    EventComplexTypeStart
-    EventComplexTypeEnd
-    EventSimpleTypeStart
-    EventSimpleTypeEnd
-    EventSequenceStart
-    EventSequenceEnd
-    EventChoiceStart
-    EventChoiceEnd
-    EventAllStart
-    EventAllEnd
-    EventAttribute
-    EventImport
-    EventInclude
-    EventAnnotation
-    EventFacet
-    EventGroup
-    EventAttributeGroup
-)
-
-// Event is emitted during streaming parse.
-type Event struct {
-    Kind       EventKind
-    Name       string
-    Namespace  string
-    Attributes map[string]string
-    Depth      int    // Nesting depth
-    Location   Location // File + line/col
-}
-
-// StreamHandler receives events during streaming parse.
-type StreamHandler interface {
-    OnEvent(event Event) error
-    // OnError is called for non-fatal parse issues (e.g., unresolved ref in streaming mode).
-    OnError(err error) error
-}
-
-// StreamParser parses XSD without building full model.
-type StreamParser struct {
-    opts    Options
-    handler StreamHandler
-}
-
-func NewStreamParser(handler StreamHandler, opts ...Option) *StreamParser
-
-// Stream parses and emits events. Does NOT resolve references (no two-pass).
-func (sp *StreamParser) Stream(r io.Reader, systemID string) error
-
-// StreamFile is a convenience for file-based streaming.
-func (sp *StreamParser) StreamFile(path string) error
-```
-
-**Use cases:**
-- Schema introspection (list all types/elements without full parse)
-- IDE tooling (autocomplete, hover info)
-- Schema validation pre-flight (check syntax without full resolution)
-- Custom schema analysis tools via plugins
-- Processing schemas too large to fit in memory
-
-**Streaming + DOM interop:**
-```go
-// CollectingHandler builds a full model from stream events (bridges stream → DOM).
-// This is the bridge: you can start streaming, then "promote" to full DOM when needed.
-type CollectingHandler struct {
-    schema *xsd.Schema
-}
-func (c *CollectingHandler) Schema() *xsd.Schema // returns built model after streaming
-
-// FilteringHandler wraps another handler and only forwards matching events.
-type FilteringHandler struct {
-    Inner     StreamHandler
-    KindFilter map[EventKind]bool
-}
-
-// TypeListHandler collects just type names (fast schema introspection).
-type TypeListHandler struct {
-    Types []QName
-}
-
-// ElementListHandler collects just global element names.
-type ElementListHandler struct {
-    Elements []QName
-}
-```
-
-**Streaming parser for import/include:**
-
-When streaming encounters `xs:import` or `xs:include`, it emits `EventImport`/`EventInclude`
-with the namespace and schemaLocation. The handler can decide whether to:
-1. Ignore (pure streaming, no I/O)
-2. Follow (create new StreamParser for the referenced schema)
-3. Defer (collect locations, resolve later)
-
-```go
-// FollowImportsHandler automatically streams imported/included schemas.
-type FollowImportsHandler struct {
-    Inner    StreamHandler
-    Resolver ImportResolver
-    visited  map[string]bool // prevent circular follows
-}
-```
-
-### 2.4 Parser Hooks (`parser/hooks.go`)
+### 2.3 Parser Hooks (`parser/hooks.go`)
 
 ```go
 // Hook allows plugins to intercept and modify parsing.
@@ -925,27 +1168,204 @@ Each test: parse XSD → assert model structure matches expectations.
 
 ## Phase 3: Code Generator (Model → Go Source)
 
-### 3.1 Type Mapping Strategy
+### 3.1 Type Mapping Strategy — Strict vs Freeform Types
+
+Users can choose between two type modes (or mix them per-type):
+
+**Freeform mode** (default): Uses plain Go types. Simple, easy to work with,
+no validation overhead. Best for trusted data or when validation happens elsewhere.
+
+**Strict mode**: Uses wrapper types with built-in validation. Each type enforces
+its XSD facets at the Go level. Best for ensuring data conforms to the schema.
+
+```go
+// codegen Options
+type Options struct {
+    // ...
+    TypeMode     TypeMode     // Freeform (default) | Strict | Mixed
+    // Per-type overrides (when TypeMode=Mixed)
+    StrictTypes  map[string]bool // type name → strict?
+    // Per-rule validation strictness
+    Validation   ValidationConfig
+}
+
+type TypeMode int
+const (
+    TypeModeFreeform TypeMode = iota // plain Go types (string, int64, etc.)
+    TypeModeStrict                    // wrapper types with validation
+    TypeModeMixed                     // per-type choice via StrictTypes map
+)
+```
+
+#### Freeform Type Mapping
 
 | XSD Construct | Go Output |
 |---|---|
 | `xs:string` | `string` |
-| `xs:int`, `xs:integer` | `int`, `int64` |
+| `xs:int` | `int32` |
+| `xs:integer` | `int64` (or `*big.Int` if unbounded) |
 | `xs:boolean` | `bool` |
 | `xs:float`/`xs:double` | `float32`/`float64` |
 | `xs:dateTime` | `time.Time` |
+| `xs:date` | `time.Time` |
+| `xs:duration` | `string` (no stdlib equivalent) |
 | `xs:base64Binary` | `[]byte` |
-| `xs:hexBinary` | `[]byte` (with custom type) |
+| `xs:hexBinary` | `[]byte` |
+| `xs:decimal` | `string` (or `*big.Rat` if configured) |
+| `xs:anyURI` | `string` |
 | `xs:complexType` (sequence) | Go struct |
 | `xs:complexType` (choice) | **Interface + concrete types** |
 | `xs:simpleType` (enum) | `type X string` + constants |
-| `xs:simpleType` (restriction) | Named type with validation |
+| `xs:simpleType` (restriction) | Named type alias (no validation) |
 | `xs:element` maxOccurs > 1 | `[]T` |
 | `xs:element` nillable | `*T` |
-| `xs:any` | `[]xml.Token` or `interface{}` |
+| `xs:any` | `[]xml.Token` or `any` |
 | `xs:group` | Embedded struct (inlined) |
 | `xs:extension` | Embedded base struct |
 | `xs:substitutionGroup` | Interface (like choice) |
+
+#### Strict Type Mapping — Validated Wrapper Types
+
+Strict types wrap the underlying Go type and enforce XSD facets:
+
+```go
+// Generated strict types live in a "xsdtypes" sub-package.
+// Example for xs:string restricted with maxLength=10, pattern=[A-Z]+:
+
+// PartCode is a strict wrapper for the PartCode XSD type.
+type PartCode struct {
+    value string
+}
+
+// NewPartCode creates a PartCode, returning an error if validation fails.
+func NewPartCode(v string) (PartCode, error) {
+    if err := validatePartCode(v); err != nil {
+        return PartCode{}, err
+    }
+    return PartCode{value: v}, nil
+}
+
+// MustPartCode panics if validation fails (for literals/tests).
+func MustPartCode(v string) PartCode {
+    pc, err := NewPartCode(v)
+    if err != nil { panic(err) }
+    return pc
+}
+
+func (p PartCode) String() string { return p.value }
+
+func validatePartCode(v string) error {
+    if len(v) > 10 {
+        return &xsdtypes.FacetError{Type: "PartCode", Facet: "maxLength", Limit: "10", Got: v}
+    }
+    if !partCodePattern.MatchString(v) {
+        return &xsdtypes.FacetError{Type: "PartCode", Facet: "pattern", Limit: "[A-Z]+", Got: v}
+    }
+    return nil
+}
+
+var partCodePattern = regexp.MustCompile(`^[A-Z]+$`)
+```
+
+**Strict types for numeric ranges:**
+```go
+// Percentage wraps int64, enforces minInclusive=0, maxInclusive=100.
+type Percentage struct { value int64 }
+
+func NewPercentage(v int64) (Percentage, error) {
+    if v < 0 { return Percentage{}, &xsdtypes.FacetError{...} }
+    if v > 100 { return Percentage{}, &xsdtypes.FacetError{...} }
+    return Percentage{value: v}, nil
+}
+```
+
+**Built-in strict types** (provided by `xsdtypes` package):
+```go
+package xsdtypes
+
+// Strict wrappers for XSD built-in types that have no exact Go equivalent.
+type Duration struct { ... }        // ISO 8601 duration with Parse/Format
+type Date struct { ... }            // date without time (year, month, day + optional TZ)
+type Time struct { ... }            // time without date
+type GYear struct { ... }           // just a year
+type GYearMonth struct { ... }      // year + month
+type GMonthDay struct { ... }       // month + day
+type GDay struct { ... }            // just a day
+type GMonth struct { ... }          // just a month
+type HexBinary struct { ... }       // []byte with hex encoding in XML/JSON
+type AnyURI struct { ... }          // validated IRI
+type Decimal struct { ... }         // arbitrary-precision decimal
+type Integer struct { ... }         // arbitrary-precision integer
+type QName struct { ... }           // namespace-qualified name
+
+// FacetError reports a validation failure.
+type FacetError struct {
+    Type   string // XSD type name
+    Facet  string // facet name (maxLength, pattern, etc.)
+    Limit  string // facet value from the schema
+    Got    string // the invalid value
+}
+func (e *FacetError) Error() string
+```
+
+### 3.1.1 Per-Rule Validation Strictness
+
+Users can configure validation strictness at the individual rule level, not just
+globally. This allows fine-grained control: e.g., enforce patterns but ignore
+length constraints, or warn instead of error on range violations.
+
+```go
+// ValidationConfig controls which validation rules are enforced.
+type ValidationConfig struct {
+    // Default behavior for all rules not explicitly configured.
+    Default ValidationLevel
+
+    // Per-rule overrides. Key is the rule category.
+    Rules map[ValidationRule]ValidationLevel
+}
+
+type ValidationLevel int
+const (
+    ValidationError ValidationLevel = iota // reject invalid values (default)
+    ValidationWarn                          // log warning via slog, accept value
+    ValidationOff                           // skip validation entirely
+)
+
+type ValidationRule int
+const (
+    RulePattern        ValidationRule = iota // regex pattern matching
+    RuleEnumeration                          // value in enum set
+    RuleMinLength                            // string/list minimum length
+    RuleMaxLength                            // string/list maximum length
+    RuleMinInclusive                         // numeric/date minimum (inclusive)
+    RuleMaxInclusive                         // numeric/date maximum (inclusive)
+    RuleMinExclusive                         // numeric/date minimum (exclusive)
+    RuleMaxExclusive                         // numeric/date maximum (exclusive)
+    RuleTotalDigits                          // decimal total digits
+    RuleFractionDigits                       // decimal fraction digits
+    RuleWhiteSpace                           // whitespace normalization
+    RuleLength                               // exact length
+    RuleDefaultValue                         // default value type-validity
+    RuleFixedValue                           // fixed value enforcement
+)
+
+// Example usage:
+opts := codegen.Options{
+    TypeMode: codegen.TypeModeStrict,
+    Validation: codegen.ValidationConfig{
+        Default: codegen.ValidationError,
+        Rules: map[codegen.ValidationRule]codegen.ValidationLevel{
+            codegen.RulePattern:    codegen.ValidationWarn,  // warn on pattern mismatch
+            codegen.RuleMaxLength:  codegen.ValidationOff,   // ignore maxLength
+        },
+    },
+}
+```
+
+**How validation levels affect generated code:**
+- `ValidationError`: generated `New*()` returns error, `Unmarshal*` returns error
+- `ValidationWarn`: generated code calls `slog.Warn()` but accepts the value
+- `ValidationOff`: no validation code generated for that rule (smaller binary)
 
 ### 3.2 Choice → Type Switch (Key Design Decision)
 
@@ -1012,19 +1432,15 @@ func (s Shape) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 package codegen
 
 type Generator struct {
-    opts  Options
-    hooks []Hook
-    tmpl  *template.Template
+    opts   Options
+    hooks  []Hook
+    tmpl   *template.Template
+    logger *slog.Logger
 }
 
-type Options struct {
-    PackageName    string
-    OutputDir      string
-    GenerateXML    bool // XML marshal/unmarshal (default true)
-    GenerateJSON   bool // JSON marshal/unmarshal
-    GenerateBER    bool // BER/ASN.1 marshal/unmarshal
-    ChoiceStyle    ChoiceStyle // TypeSwitch (default) | FlatOptional
-}
+// Options includes all fields from 3.1 (TypeMode, Validation, etc.) plus:
+//   PackageName, OutputDir, GenerateXML, GenerateJSON, GenerateBER,
+//   ChoiceStyle, TypeMode, StrictTypes, Validation
 
 func New(opts Options, hooks ...Hook) *Generator
 
@@ -1155,15 +1571,21 @@ XSD allows `<xs:appinfo>` and custom attributes in foreign namespaces. Plugins c
 
 ## Phase 6: CLI (`cmd/goxsd3`)
 
-```go
+```
 goxsd3 generate \
   --input schema.xsd \
   --output ./generated \
   --package myschema \
-  --xml \              # generate XML marshallers (default)
-  --json \             # generate JSON marshallers
-  --ber \              # generate BER marshallers
-  --choice=typeswitch  # choice strategy (typeswitch|flat)
+  --xml \                      # generate XML marshallers (default)
+  --json \                     # generate JSON marshallers
+  --ber \                      # generate BER marshallers
+  --choice=typeswitch \        # choice strategy (typeswitch|flat)
+  --type-mode=freeform \       # freeform|strict|mixed
+  --strict-types="ZipCode,Percentage" \  # types to make strict (when --type-mode=mixed)
+  --validation=error \         # default validation level (error|warn|off)
+  --validation-rule="pattern:warn,maxLength:off" \  # per-rule overrides
+  --log-level=info \           # slog level (debug|info|warn|error)
+  --log-format=text            # slog format (text|json)
 ```
 
 ### Test Plan for Phase 6
@@ -1172,17 +1594,21 @@ goxsd3 generate \
 2. CLI reads XSD files and produces Go files
 3. `go build` succeeds on generated output
 4. Integration test: end-to-end from XSD to compiled Go with round-trip marshal
+5. Strict mode generates validated types, freeform generates plain types
+6. Mixed mode applies strict only to specified types
 
 ---
 
-## Implementation Order (Build Small → Outward)
+## Implementation Order (Streaming-First, Build Outward)
 
 ### Sprint 1: Foundation + Built-in Type Registry
-- [ ] `go.mod` init
+- [ ] `go.mod` init (require Go 1.21+ for `log/slog`)
 - [ ] `xsd/` — QName, TypeRef, Namespace helpers
 - [ ] `xsd/builtin.go` — Built-in type registry with all 49 types, hfp: facet definitions
-- [ ] `xsd/facets.go` — Facet kinds, applicability table, inheritance rules
+- [ ] `xsd/facets.go` — Facet kinds, applicability table, cross-validation rules
+- [ ] `xsd/validate.go` — Default/fixed value validation, facet narrowing checks
 - [ ] `xsd/builtin_test.go` — All 19 built-in type test functions (see Phase 0.6)
+- [ ] Facet cross-validation tests (minLength > maxLength, etc.)
 - [ ] Verify: every built-in type present, hierarchy correct, facet applicability matches spec
 
 ### Sprint 2: Core Model Types
@@ -1192,18 +1618,36 @@ goxsd3 generate \
 - [ ] `xsd/constraint.go` — Restriction, Facet, Assertion
 - [ ] Unit tests for model construction and traversal
 
-### Sprint 3: Basic Parser
-- [ ] `parser/parser.go` — Parse single XSD file, two-pass architecture
-- [ ] Parse simple elements with built-in types → test: `simple_element.xsd`
-- [ ] Parse simpleType (restriction with enum, pattern) → test: `simple_type.xsd`
-- [ ] Parse complexType with sequence → test: `complex_type.xsd`
-- [ ] Parse attributes → test: `attributes.xsd`
-- [ ] Built-in type resolution: all 49 types parseable → tests: `all_primitives.xsd`, `all_derived.xsd`
+### Sprint 3: Streaming Parser (THE FOUNDATION)
+- [ ] `parser/streaming.go` — Event types, StreamHandler interface, StreamParser
+- [ ] StreamParser implementation using `encoding/xml` token reader
+- [ ] `slog` integration — structured logging for all parser events
+- [ ] Parse simple elements → emit EventElementStart/End → test: `simple_element.xsd`
+- [ ] Parse simpleType → emit EventSimpleTypeStart/End + EventFacet → test: `simple_type.xsd`
+- [ ] Parse complexType with sequence → emit compositor events → test: `complex_type.xsd`
+- [ ] Parse attributes → emit EventAttribute → test: `attributes.xsd`
+- [ ] Stream all 49 built-in types → test: `all_primitives.xsd`, `all_derived.xsd`
+- [ ] Tests: event ordering, depth tracking, location tracking
 
-### Sprint 4: Type Derivation & Facets
+### Sprint 4: Handlers (Stream → DOM)
+- [ ] `parser/handler.go` — CollectingHandler, FilteringHandler, TypeListHandler, etc.
+- [ ] CollectingHandler: builds xsd.Schema from stream events
+- [ ] Incremental symbol table: connect type refs as definitions arrive
+- [ ] Forward reference resolution (pendingRefs list, resolved at end)
+- [ ] `parser/parser.go` — DOM parser as thin wrapper (StreamParser + CollectingHandler)
+- [ ] FilteringHandler — selective event forwarding
+- [ ] MultiHandler — fan-out to multiple handlers
+- [ ] Tests: `stream_vs_dom.xsd` — parse both ways, verify identical models
+- [ ] Tests: `large_schema.xsd` event counts, `filter_test.xsd`
+
+### Sprint 5: Type Derivation, Facets & Validation
 - [ ] SimpleType restriction with facet validation (check facet applicability via registry)
+- [ ] Facet cross-validation (minLength ≤ maxLength, minInclusive ≤ maxInclusive, etc.)
+- [ ] Default/fixed value validation against declared types
 - [ ] Tests: `restrict_string.xsd`, `restrict_integer.xsd`, `restrict_decimal.xsd`
 - [ ] Invalid facet application detection → test: `invalid_facet.xsd`
+- [ ] Facet cross-validation tests → test: `invalid_facet_combo.xsd`
+- [ ] Default value validation tests → test: `invalid_defaults.xsd`
 - [ ] Chained restriction (A restricts B restricts built-in) → test: `chained_restriction.xsd`
 - [ ] SimpleType list and union → tests: `list_type.xsd`, `union_type.xsd`
 - [ ] ComplexType extension (complexContent + extension) → test: `complex_extension.xsd`
@@ -1211,7 +1655,7 @@ goxsd3 generate \
 - [ ] Multi-level inheritance (A extends B extends C) → test: `multi_level.xsd`
 - [ ] Abstract types with concrete subtypes → test: `abstract_base.xsd`
 
-### Sprint 5: Choice & Nested Compositors
+### Sprint 6: Choice & Nested Compositors
 - [ ] Parse `xs:choice` → test: `basic_choice.xsd`
 - [ ] Parse nested compositors:
   - [ ] Choice inside sequence → test: `nested_choice.xsd`
@@ -1221,14 +1665,14 @@ goxsd3 generate \
   - [ ] Mixed compositors → test: `mixed_compositors.xsd`
 - [ ] `xs:all` with maxOccurs > 1 (XSD 1.1) → test: `sequence_in_all.xsd`
 
-### Sprint 6: Advanced Features
+### Sprint 7: Advanced Features
 - [ ] Model groups (`xs:group`) and attribute groups
 - [ ] `xs:any` and `xs:anyAttribute`
 - [ ] Substitution groups
 - [ ] Tests for each
 
-### Sprint 7: Import, Include & Schema Composition
-- [ ] `parser/import.go` — xs:import handler with ImportResolver interface
+### Sprint 8: Import, Include & Schema Composition
+- [ ] `parser/import.go` — xs:import via FollowImportsHandler (streaming-aware)
 - [ ] `parser/include.go` — xs:include handler with chameleon namespace support
 - [ ] FileResolver (relative paths from importing schema)
 - [ ] Circular import/include detection (visited set by resolved URI)
@@ -1240,22 +1684,41 @@ goxsd3 generate \
 - [ ] HTTPResolver (fetch remote schemas with caching)
 - [ ] CompositeResolver (chain of resolvers)
 
-### Sprint 8: Streaming Parser
-- [ ] `parser/streaming.go` — Event types, StreamHandler interface
-- [ ] StreamParser implementation using `encoding/xml` token reader
-- [ ] FilteringHandler (only forward matching event kinds)
-- [ ] CollectingHandler (bridge stream → DOM model)
-- [ ] Tests: `large_schema.xsd` event counts, `filter_test.xsd`, `stream_vs_dom.xsd`
+### Sprint 9: Public Test Suite Integration
+- [ ] Download W3C XSD Test Suite (XSTS) subset — focus on schema validation tests
+- [ ] Categorize XSTS tests by feature (types, facets, compositors, derivation, etc.)
+- [ ] Run XSTS positive tests (valid schemas) → parse succeeds
+- [ ] Run XSTS negative tests (invalid schemas) → parse correctly rejects
+- [ ] Track pass rate, document known failures
+- [ ] Download real-world schemas: SOAP 1.1/1.2, GPX 1.1, KML 2.2, XBRL, UBL, HL7 CDA
+- [ ] Parse each real-world schema without error
+- [ ] Verify type counts and element counts match expectations
 
-### Sprint 9: Basic Code Generation
+### Sprint 10: Strict Type Library (`xsdtypes/`)
+- [ ] `xsdtypes/` package — strict wrapper types for built-in XSD types
+- [ ] Duration, Date, Time, GYear, GYearMonth, GMonthDay, GDay, GMonth
+- [ ] HexBinary, AnyURI, Decimal, Integer, QName
+- [ ] FacetError type for validation failures
+- [ ] Per-rule ValidationConfig (Error/Warn/Off per facet rule)
+- [ ] `slog.Warn` integration for ValidationWarn level
+- [ ] Tests for each strict type: valid values, boundary values, invalid values
+
+### Sprint 11: Basic Code Generation (Freeform Mode)
 - [ ] Type mapping (XSD built-in → Go, using BuiltinRegistry.GoType)
 - [ ] Struct generation from complexType + sequence
 - [ ] Pointer/slice for optional/repeated
-- [ ] User-defined simpleType → named Go type with validation
+- [ ] User-defined simpleType → named Go type alias (freeform, no validation)
 - [ ] `go/format` integration
 - [ ] Golden file tests
 
-### Sprint 10: Choice Code Generation
+### Sprint 12: Strict Mode Code Generation
+- [ ] Generate strict wrapper types with New*/Must* constructors
+- [ ] Generate validation functions based on facets
+- [ ] Per-rule validation strictness in generated code
+- [ ] TypeModeMixed: per-type strict/freeform selection
+- [ ] Golden file tests (strict mode variants)
+
+### Sprint 13: Choice Code Generation
 - [ ] Interface + concrete types for `xs:choice`
 - [ ] Type switch marshal/unmarshal generation
 - [ ] Nested choice → nested interfaces / flattened where possible
@@ -1263,70 +1726,93 @@ goxsd3 generate \
 - [ ] Choice-in-sequence → interface field
 - [ ] Tests with compilation check
 
-### Sprint 11: Full Codegen
+### Sprint 14: Full Codegen
 - [ ] Enum generation (typed string constants)
 - [ ] Extension → embedded struct (ComplexType inheritance)
 - [ ] Group inlining
-- [ ] Any → `interface{}` / `xml.Token`
+- [ ] Any → `any` / `xml.Token`
 - [ ] Golden file tests for all
 
-### Sprint 12: XML Marshallers
+### Sprint 15: XML Marshallers
 - [ ] Generate `MarshalXML` / `UnmarshalXML`
 - [ ] Choice type switch in marshaller
 - [ ] Namespace handling
+- [ ] Strict mode: validation during unmarshal (per-rule config)
 - [ ] Round-trip tests
 
-### Sprint 13: JSON Marshallers
+### Sprint 16: JSON Marshallers
 - [ ] Generate `MarshalJSON` / `UnmarshalJSON`
 - [ ] Discriminated union for choice types
 - [ ] Round-trip tests
 
-### Sprint 14: BER Marshallers
+### Sprint 17: BER Marshallers
 - [ ] ASN.1 type mapping
 - [ ] Generate BER marshal/unmarshal
 - [ ] Round-trip tests
 
-### Sprint 15: XSD 1.1 Features
+### Sprint 18: XSD 1.1 Features
 - [ ] Assertions (`xs:assert`) — store in model, optionally generate validation
 - [ ] Conditional type assignment (`xs:alternative`)
 - [ ] Open content (`xs:openContent`)
 - [ ] Enhanced wildcards
 - [ ] Tests for each
 
-### Sprint 16: Plugin System
+### Sprint 19: Plugin System
 - [ ] Hook interfaces finalized
 - [ ] Plugin registry
 - [ ] Sample plugins (rename, custom tags, validation)
 - [ ] Plugin tests
 
-### Sprint 17: CLI & Polish
-- [ ] CLI with flag parsing
+### Sprint 20: CLI & Polish
+- [ ] CLI with flag parsing (including `--type-mode`, `--validation`)
+- [ ] `slog` handler configuration via CLI (`--log-level`, `--log-format`)
 - [ ] End-to-end integration tests
 - [ ] Error messages and diagnostics
-- [ ] Documentation
+- [ ] Run full XSTS + real-world test suite as CI gate
 
 ---
 
 ## Key Design Decisions
 
-### 1. Choice = Type Switch (not flat optional fields)
+### 1. Streaming-First Parser
+The streaming parser is the foundation — the DOM parser is built on top via
+`CollectingHandler`. This ensures a single XML reading path, makes the streaming
+parser the most exercised code path, and enables use cases from fast introspection
+to full schema loading with the same battle-tested tokenizer.
+
+### 2. Choice = Type Switch (not flat optional fields)
 Existing tools flatten choices into optional fields, losing type safety. We generate interfaces with a type switch, which is idiomatic Go and preserves the XSD semantics.
 
-### 2. Two-Pass Parser
-Pass 1 collects symbols, Pass 2 resolves references. This handles forward references and circular types cleanly.
+### 3. Incremental Reference Resolution
+As stream events arrive, type definitions are added to the symbol table immediately.
+References are resolved eagerly when possible, with forward references collected and
+resolved in a final pass. This means the DOM parser needs only one streaming pass
+plus a fast resolution sweep, not two full XML parses.
 
-### 3. Template-Based Codegen
+### 4. Strict vs Freeform Types
+Users choose between plain Go types (freeform, easy, no overhead) and validated
+wrapper types (strict, enforces XSD facets at the Go level). Mixed mode allows
+per-type selection. Validation strictness is configurable at the individual rule
+level (error/warn/off).
+
+### 5. Template-Based Codegen
 Use `text/template` with `go/format` rather than AST construction. Templates are easier to read, modify, and debug. Plugins can modify the model before template rendering or post-process the output.
 
-### 4. Hooks at Every Phase
+### 6. Hooks at Every Phase
 Four hook points: Parser → Model → Codegen → Marshal. Each hook can modify, add, or reject. This allows plugins to:
 - Add custom struct tags during codegen
 - Override type mappings
 - Inject validation logic
 - Handle proprietary XSD extensions
 
-### 5. BER via Struct Tags
+### 7. BER via Struct Tags
 Generate ASN.1 struct tags on the same Go types, so a single struct can marshal to XML, JSON, and BER. Use `asn1:"..."` tags alongside `xml:"..."` and `json:"..."`.
+
+### 8. Structured Logging with slog
+All components use `log/slog` for structured, leveled logging. Log groups
+(`parser.stream`, `parser.resolve`, `parser.import`, `parser.validate`)
+provide fine-grained control. The logger is injected via Options, defaulting
+to `slog.Default()`.
 
 ---
 
@@ -1334,20 +1820,75 @@ Generate ASN.1 struct tags on the same Go types, so a single struct can marshal 
 
 ### Unit Tests
 - Model construction and traversal
-- Parser: one test per XSD construct
-- Codegen: golden file comparison
+- Facet cross-validation (contradictory facets rejected)
+- Default/fixed value validation
+- Parser: one test per XSD construct (via streaming + DOM)
+- Codegen: golden file comparison (both freeform and strict mode)
 - Marshallers: round-trip per format
+- Strict types: boundary value testing, invalid value rejection
 
 ### Integration Tests
 - End-to-end: XSD file → parse → generate → compile → instantiate → marshal → unmarshal → compare
 - Cross-format: XML → JSON → XML round-trip
 - Multi-file schemas with imports
+- Stream vs DOM: parse same schema both ways, verify identical results
 
-### Conformance Tests
-- W3C XSD test suite (subset) for parser validation
-- Real-world XSD files (SOAP, WSDL, GPX, KML, XBRL) as smoke tests
+### Public Conformance Tests
+
+#### W3C XSD Test Suite (XSTS)
+The W3C publishes an official test suite for XSD processors:
+- **Source**: https://www.w3.org/XML/2004/xml-schema-test-suite/
+- **Structure**: categorized by feature (types, facets, compositors, identity constraints, etc.)
+- **Positive tests**: valid schemas that must parse successfully
+- **Negative tests**: invalid schemas that must be rejected with appropriate errors
+- We download a curated subset and run it as part of CI
+- Track pass rates per category, document known limitations
+
+```
+testdata/w3c/
+├── README.md                    # which XSTS version, how to update
+├── positive/                    # schemas that must parse
+│   ├── datatypes/               # built-in type tests
+│   ├── facets/                  # facet application tests
+│   ├── compositors/             # sequence/choice/all tests
+│   ├── derivation/              # restriction/extension tests
+│   └── identity/                # key/keyref/unique tests
+├── negative/                    # schemas that must be rejected
+│   ├── invalid_facets/          # contradictory or inapplicable facets
+│   ├── invalid_derivation/      # illegal restriction/extension
+│   └── invalid_defaults/        # default values that violate types
+└── results.json                 # expected pass/fail for each test
+```
+
+#### Real-World Schema Smoke Tests
+Parse well-known public schemas to ensure compatibility:
+
+```
+testdata/realworld/
+├── soap_1_1.xsd                 # SOAP 1.1 envelope
+├── soap_1_2.xsd                 # SOAP 1.2 envelope
+├── wsdl_1_1.xsd                 # WSDL 1.1
+├── gpx_1_1.xsd                  # GPS Exchange Format
+├── kml_2_2.xsd                  # Keyhole Markup Language
+├── xbrl_2_1.xsd                 # Financial reporting
+├── ubl_2_1/                     # Universal Business Language (multi-file)
+│   ├── UBL-Invoice-2.1.xsd
+│   └── common/                  # shared types
+├── hl7_cda.xsd                  # Health Level 7 Clinical Document
+├── svg_1_1.xsd                  # Scalable Vector Graphics
+├── xhtml_1_0.xsd                # XHTML
+└── expected.json                # expected type/element counts per schema
+```
+
+Each real-world schema test verifies:
+1. Parsing completes without error
+2. Number of types/elements matches expected counts
+3. Key types are present and correctly structured
+4. Import/include chains resolve correctly
 
 ### Benchmarks
-- Parser performance on large schemas
+- Streaming parser throughput (events/sec on large schemas)
+- DOM parser performance (streaming + CollectingHandler)
 - Codegen throughput
 - Marshal/unmarshal performance vs hand-written code
+- Memory usage: streaming vs DOM on large schemas
