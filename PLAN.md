@@ -170,76 +170,102 @@ func (r *BuiltinRegistry) GoType(name QName) string
 
 ### 0.3 Complete Built-in Type Hierarchy
 
+**Total: 49 named types** (2 ur-types + 1 XSD 1.1 intermediate + 19 primitives + 24 derived + 3 list types)
+
 ```
-anyType
-├── anySimpleType
-│   ├── string
-│   │   ├── normalizedString
-│   │   │   └── token
-│   │   │       ├── language
-│   │   │       ├── NMTOKEN
-│   │   │       ├── Name
-│   │   │       │   └── NCName
-│   │   │       │       ├── ID
-│   │   │       │       ├── IDREF
-│   │   │       │       └── ENTITY
-│   │   │       └── (token-derived)
-│   │   └── (string-derived)
-│   ├── boolean
-│   ├── decimal
-│   │   └── integer
-│   │       ├── nonPositiveInteger
-│   │       │   └── negativeInteger
-│   │       ├── long
-│   │       │   └── int
-│   │       │       └── short
-│   │       │           └── byte
-│   │       ├── nonNegativeInteger
-│   │       │   ├── unsignedLong
-│   │       │   │   └── unsignedInt
-│   │       │   │       └── unsignedShort
-│   │       │   │           └── unsignedByte
-│   │       │   └── positiveInteger
-│   │       └── (integer-derived)
-│   ├── float
-│   ├── double
-│   ├── duration
-│   │   ├── yearMonthDuration    (XSD 1.1)
-│   │   └── dayTimeDuration      (XSD 1.1)
-│   ├── dateTime
-│   │   └── dateTimeStamp        (XSD 1.1)
-│   ├── time
-│   ├── date
-│   ├── gYearMonth
-│   ├── gYear
-│   ├── gMonthDay
-│   ├── gDay
-│   ├── gMonth
-│   ├── hexBinary
-│   ├── base64Binary
-│   ├── anyURI
-│   ├── QName
-│   └── NOTATION
+anyType                                    (ur-type, root of all types)
+├── anySimpleType                          (ur-type for all simple types)
+│   ├── anyAtomicType                      (XSD 1.1, base of all 19 primitives)
+│   │   ├── string                         ← PRIMITIVE
+│   │   │   └── normalizedString           (whiteSpace=replace)
+│   │   │       └── token                  (whiteSpace=collapse)
+│   │   │           ├── language           (pattern=[a-zA-Z]{1,8}(-[a-zA-Z0-9]{1,8})*)
+│   │   │           ├── NMTOKEN            (pattern=\c+)
+│   │   │           ├── Name               (pattern=...)
+│   │   │           │   └── NCName         (pattern=no colons)
+│   │   │           │       ├── ID
+│   │   │           │       ├── IDREF
+│   │   │           │       └── ENTITY
+│   │   │           └── (token-derived)
+│   │   ├── boolean                        ← PRIMITIVE
+│   │   ├── decimal                        ← PRIMITIVE
+│   │   │   └── integer                    (fractionDigits=0)
+│   │   │       ├── nonPositiveInteger     (maxInclusive=0)
+│   │   │       │   └── negativeInteger    (maxInclusive=-1)
+│   │   │       ├── long                   (min/maxInclusive=±2^63)
+│   │   │       │   └── int               (min/maxInclusive=±2^31)
+│   │   │       │       └── short          (min/maxInclusive=±2^15)
+│   │   │       │           └── byte       (min/maxInclusive=±2^7)
+│   │   │       ├── nonNegativeInteger     (minInclusive=0)
+│   │   │       │   ├── unsignedLong       (maxInclusive=2^64-1)
+│   │   │       │   │   └── unsignedInt    (maxInclusive=2^32-1)
+│   │   │       │   │       └── unsignedShort (maxInclusive=2^16-1)
+│   │   │       │   │           └── unsignedByte (maxInclusive=2^8-1)
+│   │   │       │   └── positiveInteger    (minInclusive=1)
+│   │   │       └── (integer-derived)
+│   │   ├── float                          ← PRIMITIVE
+│   │   ├── double                         ← PRIMITIVE
+│   │   ├── duration                       ← PRIMITIVE
+│   │   │   ├── yearMonthDuration          (XSD 1.1, pattern restricts to P...Y...M)
+│   │   │   └── dayTimeDuration            (XSD 1.1, pattern restricts to P...DT...H...M...S)
+│   │   ├── dateTime                       ← PRIMITIVE
+│   │   │   └── dateTimeStamp             (XSD 1.1, explicitTimezone=required)
+│   │   ├── time                           ← PRIMITIVE
+│   │   ├── date                           ← PRIMITIVE
+│   │   ├── gYearMonth                     ← PRIMITIVE
+│   │   ├── gYear                          ← PRIMITIVE
+│   │   ├── gMonthDay                      ← PRIMITIVE
+│   │   ├── gDay                           ← PRIMITIVE
+│   │   ├── gMonth                         ← PRIMITIVE
+│   │   ├── hexBinary                      ← PRIMITIVE
+│   │   ├── base64Binary                   ← PRIMITIVE
+│   │   ├── anyURI                         ← PRIMITIVE
+│   │   ├── QName                          ← PRIMITIVE
+│   │   └── NOTATION                       ← PRIMITIVE
+│   │
+│   └── Built-in List Types (derived by list, NOT restriction):
+│       ├── NMTOKENS                       (list of NMTOKEN, minLength=1)
+│       ├── IDREFS                         (list of IDREF, minLength=1)
+│       └── ENTITIES                       (list of ENTITY, minLength=1)
+│
 └── (complex types derive from anyType)
 ```
 
 ### 0.4 Facet Applicability Table
 
+**XSD 1.0 Facets (14 total):**
+
 | Type Family     | length | minLen | maxLen | pattern | enum | whiteSpace | maxIncl | maxExcl | minIncl | minExcl | totalDig | fracDig |
 |-----------------|--------|--------|--------|---------|------|------------|---------|---------|---------|---------|----------|---------|
 | string          |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓      |         |         |         |         |          |         |
-| boolean         |        |        |        |    ✓    |      |     ✓      |         |         |         |         |          |         |
-| decimal         |        |        |        |    ✓    |  ✓   |     ✓      |    ✓    |    ✓    |    ✓    |    ✓    |    ✓     |    ✓    |
-| float/double    |        |        |        |    ✓    |  ✓   |     ✓      |    ✓    |    ✓    |    ✓    |    ✓    |          |         |
-| duration        |        |        |        |    ✓    |  ✓   |     ✓      |    ✓    |    ✓    |    ✓    |    ✓    |          |         |
-| dateTime/date.. |        |        |        |    ✓    |  ✓   |     ✓      |    ✓    |    ✓    |    ✓    |    ✓    |          |         |
-| hexBinary       |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓      |         |         |         |         |          |         |
-| base64Binary    |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓      |         |         |         |         |          |         |
-| anyURI          |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓      |         |         |         |         |          |         |
-| QName/NOTATION  |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓      |         |         |         |         |          |         |
-| integer         |        |        |        |    ✓    |  ✓   |     ✓      |    ✓    |    ✓    |    ✓    |    ✓    |    ✓     |    ✓*   |
+| boolean         |        |        |        |    ✓    |      |     ✓†     |         |         |         |         |          |         |
+| decimal         |        |        |        |    ✓    |  ✓   |     ✓†     |    ✓    |    ✓    |    ✓    |    ✓    |    ✓     |    ✓    |
+| float/double    |        |        |        |    ✓    |  ✓   |     ✓†     |    ✓    |    ✓    |    ✓    |    ✓    |          |         |
+| duration        |        |        |        |    ✓    |  ✓   |     ✓†     |    ✓    |    ✓    |    ✓    |    ✓    |          |         |
+| dateTime/date.. |        |        |        |    ✓    |  ✓   |     ✓†     |    ✓    |    ✓    |    ✓    |    ✓    |          |         |
+| hexBinary       |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓†     |         |         |         |         |          |         |
+| base64Binary    |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓†     |         |         |         |         |          |         |
+| anyURI          |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓†     |         |         |         |         |          |         |
+| QName/NOTATION  |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓†     |         |         |         |         |          |         |
+| integer (deriv) |        |        |        |    ✓    |  ✓   |     ✓†     |    ✓    |    ✓    |    ✓    |    ✓    |    ✓     |    ✓‡   |
+| list types      |   ✓    |   ✓    |   ✓    |    ✓    |  ✓   |     ✓†     |         |         |         |         |          |         |
 
-*fractionDigits is fixed to 0 for integer types.
+†whiteSpace is fixed at `collapse` for all non-string primitive types (cannot be changed).
+‡fractionDigits is fixed to 0 for integer and all integer-derived types.
+
+**XSD 1.1 Additional Facets:**
+
+| Type Family     | explicitTimezone | minScale | maxScale |
+|-----------------|------------------|----------|----------|
+| dateTime/date.. |        ✓         |          |          |
+| decimal         |                  |    ✓     |    ✓     |
+
+**Key rules for facet application:**
+- `boolean` does NOT support `enumeration` (already has exactly two values)
+- Derived types inherit all facets from their base primitive
+- Facets marked `fixed="true"` cannot be overridden in further derivations
+- Union types only support: `pattern`, `enumeration`
+- List types only support: `length`, `minLength`, `maxLength`, `pattern`, `enumeration`, `whiteSpace`
 
 ### 0.5 User-Defined Type Derivation
 
@@ -781,12 +807,43 @@ func (sp *StreamParser) StreamFile(path string) error
 **Streaming + DOM interop:**
 ```go
 // CollectingHandler builds a full model from stream events (bridges stream → DOM).
-type CollectingHandler struct { ... }
+// This is the bridge: you can start streaming, then "promote" to full DOM when needed.
+type CollectingHandler struct {
+    schema *xsd.Schema
+}
+func (c *CollectingHandler) Schema() *xsd.Schema // returns built model after streaming
 
 // FilteringHandler wraps another handler and only forwards matching events.
 type FilteringHandler struct {
     Inner     StreamHandler
     KindFilter map[EventKind]bool
+}
+
+// TypeListHandler collects just type names (fast schema introspection).
+type TypeListHandler struct {
+    Types []QName
+}
+
+// ElementListHandler collects just global element names.
+type ElementListHandler struct {
+    Elements []QName
+}
+```
+
+**Streaming parser for import/include:**
+
+When streaming encounters `xs:import` or `xs:include`, it emits `EventImport`/`EventInclude`
+with the namespace and schemaLocation. The handler can decide whether to:
+1. Ignore (pure streaming, no I/O)
+2. Follow (create new StreamParser for the referenced schema)
+3. Defer (collect locations, resolve later)
+
+```go
+// FollowImportsHandler automatically streams imported/included schemas.
+type FollowImportsHandler struct {
+    Inner    StreamHandler
+    Resolver ImportResolver
+    visited  map[string]bool // prevent circular follows
 }
 ```
 
