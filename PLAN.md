@@ -12,9 +12,9 @@ A Go library and CLI tool that:
 
 ## Architecture Overview
 
-**Streaming-first**: The streaming parser is the foundation. The DOM parser is built
-on top of it via `CollectingHandler`. This ensures a single XML reading path and
-makes the streaming parser the most tested, most exercised code path.
+**Simple, direct parsing**: The parser uses `encoding/xml.Decoder` from the standard
+library to read XSD token-by-token and build the schema model directly. A `LocatingReader`
+wrapper tracks line/column numbers for precise error messages.
 
 ```
                      ┌───────────────────┐
@@ -23,29 +23,26 @@ makes the streaming parser the most tested, most exercised code path.
                      └────────┬──────────┘
                               │ bootstrap
 ┌──────────────┐     ┌───────▼──────────────────┐     ┌──────────────────┐
-│  XSD Files   │────▶│  Streaming Parser         │────▶│   Schema Model   │
-│  (.xsd)      │     │  (SAX-style events)       │     │   (AST / IR)     │
+│  XSD Files   │────▶│  Parser                   │────▶│   Schema Model   │
+│  (.xsd)      │     │  (xml.Decoder + locate)   │     │   (AST / IR)     │
 └──────────────┘     │                            │     └────────┬─────────┘
-       │             │  ┌─ CollectingHandler ──┐  │              │
-  ┌────▼────┐        │  │  (builds full DOM)   │  │     ┌────────▼─────────┐
+       │             │  ┌─ LocatingReader ─────┐  │              │
+  ┌────▼────┐        │  │  (line/col tracking) │  │     ┌────────▼─────────┐
   │ import/ │        │  └──────────────────────┘  │     │     CodeGen      │
-  │ include │        │  ┌─ TypeListHandler ────┐  │     └────────┬─────────┘
-  └─────────┘        │  │  (fast introspection)│  │              │
+  │ include │        │  ┌─ SymbolTable ────────┐  │     └────────┬─────────┘
+  └─────────┘        │  │  (incremental refs)  │  │              │
                      │  └──────────────────────┘  │     ┌────────┼─────────┐
-                     │  ┌─ FilteringHandler ───┐  │     ▼        ▼         ▼
-                     │  │  (selective events)  │  │   XML      JSON      BER
-                     │  └──────────────────────┘  │  Marshal  Marshal  Marshal
-                     └────────────────────────────┘
-                              │
-                         ┌────▼─────┐
+                     └────────────────────────────┘     ▼        ▼         ▼
+                              │                       XML      JSON      BER
+                         ┌────▼─────┐                Marshal  Marshal  Marshal
                          │   slog   │  (structured logging throughout)
                          └──────────┘
 ```
 
-**Key insight**: `parser.Parse()` internally creates a `StreamParser` + `CollectingHandler`,
-so the DOM parser is just a convenience wrapper. Users who need streaming get the same
-battle-tested tokenizer. The `CollectingHandler` connects references as type definitions
-are encountered during the stream, maintaining a symbol table that grows incrementally.
+**Key insight**: `parser.Parse()` uses `xml.Decoder` in a simple token loop, building the
+schema model incrementally. The parser connects references as type definitions are
+encountered, maintaining a symbol table that grows during the parse. Forward references
+are resolved in a final pass after all tokens are consumed.
 
 ### Package Layout
 
@@ -66,9 +63,8 @@ goxsd3/
 │   ├── constraint.go    # Facets, assertions, identity constraints
 │   └── namespace.go     # Namespace & import resolution
 ├── parser/              # XSD parser (XML → model)
-│   ├── streaming.go     # Streaming parser (SAX-style event callbacks) — THE FOUNDATION
-│   ├── handler.go       # CollectingHandler (stream → DOM), FilteringHandler, etc.
-│   ├── parser.go        # DOM parser (convenience wrapper: StreamParser + CollectingHandler)
+│   ├── locate.go       # LocatingReader — wraps io.Reader with line/col tracking
+│   ├── parser.go        # Parser — xml.Decoder token loop, builds schema model directly
 │   ├── resolve.go       # Type/ref resolution, import/include/redefine
 │   ├── import.go        # xs:import handler (cross-namespace)
 │   ├── include.go       # xs:include handler (same-namespace)
@@ -106,7 +102,7 @@ goxsd3/
     ├── derivation/      # SimpleType restriction, ComplexType extension
     ├── imports/         # import/include/redefine multi-file tests
     ├── nested/          # Deeply nested compositor tests
-    ├── streaming/       # Streaming parser test fixtures
+    ├── parser/          # Parser test fixtures
     ├── xsd11/
     ├── naming/          # Anonymous type naming tests
     ├── w3c/             # W3C XSD Test Suite (XSTS) subset
@@ -744,9 +740,9 @@ type Assertion struct { // XSD 1.1
 
 ## Phase 2: Parser (XSD XML → Model)
 
-**Streaming-first architecture**: The streaming parser (`parser/streaming.go`) is the
-foundation. The DOM parser (`parser/parser.go`) is a thin wrapper that feeds the stream
-into a `CollectingHandler` which builds the full model.
+**Direct parsing**: The parser (`parser/parser.go`) uses `xml.Decoder` from the standard
+library to read XSD token-by-token and build the schema model directly. A `LocatingReader`
+wraps the input to track line/column numbers for precise error messages.
 
 ### 2.0 Logging with `slog`
 
@@ -774,179 +770,53 @@ func WithSchemaStrictness(c ValidationConfig) Option
 ```
 
 Log groups for structured context:
-- `parser.stream` — streaming parser events
+- `parser.parse` — token-level parsing events
 - `parser.resolve` — type/ref resolution
 - `parser.import` — import/include processing
 - `parser.validate` — facet/default validation
 
-### 2.1 Streaming Parser — THE FOUNDATION (`parser/streaming.go`)
+### 2.1 LocatingReader — Line/Column Tracking (`parser/locate.go`)
 
-The streaming parser reads XSD using `encoding/xml` token-by-token and emits
-typed events. It is the single XML reading path — all other parsing builds on it.
+`xml.Decoder` provides `InputOffset()` (byte offset) but no line/column info.
+We wrap the `io.Reader` with a `LocatingReader` that tracks line and column
+numbers as bytes flow through, so the parser can produce precise error locations.
 
 ```go
 package parser
 
-// Event types emitted by the streaming parser.
-type EventKind int
-
-const (
-    EventSchemaStart EventKind = iota
-    EventSchemaEnd
-    EventElementStart
-    EventElementEnd
-    EventComplexTypeStart
-    EventComplexTypeEnd
-    EventSimpleTypeStart
-    EventSimpleTypeEnd
-    EventSequenceStart
-    EventSequenceEnd
-    EventChoiceStart
-    EventChoiceEnd
-    EventAllStart
-    EventAllEnd
-    EventAttribute
-    EventImport
-    EventInclude
-    EventRedefine        // xs:redefine
-    EventOverride        // xs:override (XSD 1.1)
-    EventAnnotation
-    EventFacet
-    EventGroup
-    EventGroupEnd
-    EventAttributeGroup
-    EventAttributeGroupEnd
-    EventRestriction
-    EventExtension
-    EventList
-    EventUnion
-)
-
-// Event is emitted during streaming parse.
-type Event struct {
-    Kind       EventKind
-    Name       string
-    Namespace  string
-    Attributes map[string]string // raw XML attributes
-    Depth      int               // nesting depth in XSD structure
-    Location   Location          // file + line/col
-}
-
+// Location identifies a position in an XSD source file.
 type Location struct {
     SystemID string // file path or URI
     Line     int
     Col      int
+    Offset   int64  // byte offset (from xml.Decoder.InputOffset())
 }
 
-// StreamHandler receives events during streaming parse.
-type StreamHandler interface {
-    OnEvent(event Event) error
-    OnError(err error) error
+// LocatingReader wraps an io.Reader and tracks line/column numbers.
+// It counts newlines (\n) as they pass through Read(), so at any point
+// we can map xml.Decoder.InputOffset() to a line:col position.
+type LocatingReader struct {
+    inner     io.Reader
+    lines     []int64  // byte offset of each line start
+    totalRead int64
 }
 
-// StreamParser parses XSD token-by-token and emits events.
-type StreamParser struct {
-    opts    Options
-    handler StreamHandler
-    logger  *slog.Logger
-}
+func NewLocatingReader(r io.Reader) *LocatingReader
 
-func NewStreamParser(handler StreamHandler, opts ...Option) *StreamParser
+// Read implements io.Reader, tracking line positions as bytes flow through.
+func (lr *LocatingReader) Read(p []byte) (int, error)
 
-// Stream parses and emits events from an io.Reader.
-func (sp *StreamParser) Stream(r io.Reader, systemID string) error
-
-// StreamFile is a convenience for file-based streaming.
-func (sp *StreamParser) StreamFile(path string) error
+// Location returns the Location for a given byte offset (from xml.Decoder.InputOffset()).
+// Uses binary search over lr.lines to find the line number, then computes column.
+func (lr *LocatingReader) Location(offset int64, systemID string) Location
 ```
 
-### 2.1.1 CollectingHandler — Stream → DOM (`parser/handler.go`)
+### 2.2 Parser (`parser/parser.go`)
 
-The `CollectingHandler` builds the full schema model from stream events. It maintains
-an incremental symbol table so that type references can be connected as definitions
-are encountered during the stream.
-
-```go
-// CollectingHandler builds a full xsd.Schema from stream events.
-// This is the bridge between streaming and DOM parsing.
-type CollectingHandler struct {
-    schema   *xsd.Schema
-    registry *xsd.BuiltinRegistry
-    symbols  *SymbolTable
-    stack    []buildContext      // stack of in-progress constructs
-    logger   *slog.Logger
-
-    // Incremental reference resolution:
-    // As type definitions are seen, they're added to the symbol table.
-    // Forward references are collected and resolved in a final pass.
-    pendingRefs []pendingRef
-}
-
-type pendingRef struct {
-    ref      xsd.TypeRef
-    location Location
-    setter   func(xsd.Type) // callback to wire up the reference
-}
-
-// Schema returns the built model. Call after streaming completes.
-// Performs final reference resolution and validation.
-func (c *CollectingHandler) Schema() (*xsd.Schema, error)
-
-// OnEvent processes each stream event, building the model incrementally.
-func (c *CollectingHandler) OnEvent(event Event) error
-
-// OnError logs and optionally collects non-fatal errors.
-func (c *CollectingHandler) OnError(err error) error
-```
-
-**Incremental resolution strategy:**
-1. As `EventComplexTypeStart`/`EventSimpleTypeStart` events arrive, definitions
-   are added to the symbol table immediately
-2. When a `type="..."` or `base="..."` reference is encountered, check the symbol
-   table — if found, wire it up immediately; if not, add to `pendingRefs`
-3. After streaming completes, resolve all `pendingRefs` (forward references)
-4. Any remaining unresolved refs are errors (unless from imported namespaces
-   that haven't been loaded yet)
-
-### 2.1.2 Other Built-in Handlers
-
-```go
-// FilteringHandler wraps another handler and only forwards matching events.
-type FilteringHandler struct {
-    Inner      StreamHandler
-    KindFilter map[EventKind]bool
-}
-
-// TypeListHandler collects just type names (fast schema introspection).
-type TypeListHandler struct {
-    Types []xsd.QName
-}
-
-// ElementListHandler collects just global element names.
-type ElementListHandler struct {
-    Elements []xsd.QName
-}
-
-// MultiHandler fans out events to multiple handlers.
-type MultiHandler struct {
-    Handlers []StreamHandler
-}
-
-// FollowImportsHandler automatically streams imported/included schemas.
-// When it receives EventImport/EventInclude, it calls the SchemaResolver to
-// get the bytes, creates a new StreamParser, and feeds the result to Inner.
-// Everything is synchronous — no goroutines.
-type FollowImportsHandler struct {
-    Inner    StreamHandler
-    Resolver SchemaResolver
-    visited  map[string]bool // prevent circular follows
-    logger   *slog.Logger
-}
-```
-
-### 2.2 DOM Parser — Convenience Wrapper (`parser/parser.go`)
-
-The DOM parser is a thin wrapper: StreamParser + CollectingHandler + resolution pass.
+The parser reads XSD using `xml.Decoder` in a simple token loop and builds the
+schema model directly. No intermediate event types or handler abstractions — just
+a switch on `xml.StartElement` local names to dispatch to type-specific builder
+methods.
 
 ```go
 package parser
@@ -962,31 +832,88 @@ type Parser struct {
 func New(opts ...Option) *Parser
 
 // Parse parses one or more XSD files and returns the resolved schema set.
-// Internally uses StreamParser + CollectingHandler.
 func (p *Parser) Parse(files ...string) (*xsd.SchemaSet, error)
 
 // ParseReader parses from an io.Reader.
 func (p *Parser) ParseReader(r io.Reader, systemID string) (*xsd.SchemaSet, error)
 
+// parseOne reads a single XSD document using xml.Decoder and builds
+// the schema model directly.
+func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error)
+
 // Parse implementation (pseudocode):
-// func (p *Parser) Parse(files ...string) (*xsd.SchemaSet, error) {
-//     for _, file := range files {
-//         handler := NewCollectingHandler(p.registry, p.symbols, p.logger)
-//         followHandler := &FollowImportsHandler{
-//             Inner: handler, Resolver: p.resolver, // SchemaResolver
+// func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error) {
+//     lr := NewLocatingReader(r)
+//     dec := xml.NewDecoder(lr)
+//     schema := &xsd.Schema{}
+//     var stack []buildContext
+//     var pendingRefs []pendingRef
+//
+//     for {
+//         tok, err := dec.Token()
+//         if err == io.EOF { break }
+//         if err != nil {
+//             loc := lr.Location(dec.InputOffset(), systemID)
+//             return nil, fmt.Errorf("%s:%d:%d: %w", loc.SystemID, loc.Line, loc.Col, err)
 //         }
-//         sp := NewStreamParser(followHandler, p.opts)
-//         // Everything is synchronous — no goroutines anywhere.
-//         if err := sp.StreamFile(file); err != nil { return nil, err }
-//         schema, err := handler.Schema()
-//         // ... add to schema set
+//         switch t := tok.(type) {
+//         case xml.StartElement:
+//             loc := lr.Location(dec.InputOffset(), systemID)
+//             switch t.Name.Local {
+//             case "schema":
+//                 p.parseSchemaAttrs(schema, t.Attr)
+//             case "element":
+//                 elem := p.buildElement(t.Attr, loc)
+//                 // push onto stack, add to current context
+//             case "complexType":
+//                 ct := p.buildComplexType(t.Attr, loc)
+//                 p.symbols.AddType(ct) // available immediately for back-refs
+//             case "simpleType":
+//                 st := p.buildSimpleType(t.Attr, loc)
+//                 p.symbols.AddType(st)
+//             case "sequence", "choice", "all":
+//                 comp := p.buildCompositor(t.Name.Local, t.Attr, loc)
+//             case "attribute":
+//                 attr := p.buildAttribute(t.Attr, loc)
+//             case "import":
+//                 // Synchronously resolve and parse the imported schema
+//                 p.handleImport(t.Attr, loc)
+//             case "include":
+//                 p.handleInclude(t.Attr, loc)
+//             // ... restriction, extension, facets, groups, etc.
+//             }
+//         case xml.EndElement:
+//             // pop stack, finalize current construct
+//         }
 //     }
-//     // Final cross-schema resolution pass (also synchronous)
-//     return p.resolveAll()
+//     // Resolve forward references
+//     for _, ref := range pendingRefs {
+//         if typ := p.symbols.Lookup(ref.qname); typ != nil {
+//             ref.setter(typ)
+//         } else {
+//             return nil, fmt.Errorf("%s: unresolved type %q", ref.location, ref.qname)
+//         }
+//     }
+//     return schema, nil
 // }
 ```
 
-### 2.2 Import/Include Resolution (Deep Dive)
+**Incremental resolution strategy:**
+1. As `complexType`/`simpleType` start elements are parsed, definitions are
+   added to the symbol table immediately
+2. When a `type="..."` or `base="..."` reference is encountered, check the symbol
+   table — if found, wire it up immediately; if not, add to `pendingRefs`
+3. After the token loop completes, resolve all `pendingRefs` (forward references)
+4. Any remaining unresolved refs are errors (unless from imported namespaces
+   that haven't been loaded yet)
+
+**Import/include handling:**
+When the parser encounters `<xs:import>` or `<xs:include>`, it synchronously
+resolves the schema via `SchemaResolver`, parses it recursively with `parseOne()`,
+and merges the resulting types into the symbol table. A `visited` set prevents
+circular imports. Everything is synchronous — no goroutines.
+
+### 2.3 Import/Include Resolution (Deep Dive)
 
 Schema composition is critical for real-world XSD usage. Three mechanisms exist:
 
@@ -1165,7 +1092,7 @@ testdata/imports/
     └── main.xsd              # uses catalog for resolution
 ```
 
-### 2.3 Parser Hooks (`parser/hooks.go`)
+### 2.4 Parser Hooks (`parser/hooks.go`)
 
 ```go
 // Hook allows plugins to intercept and modify parsing.
@@ -1232,10 +1159,10 @@ type Hook interface {
 40. `testdata/xsd11/alternative.xsd` — conditional type assignment
 41. `testdata/xsd11/open_content.xsd` — open content model
 
-#### Streaming Parser
-42. `testdata/streaming/large_schema.xsd` — schema with 100+ types (event count test)
-43. `testdata/streaming/filter_test.xsd` — verify filtering handler
-44. `testdata/streaming/stream_vs_dom.xsd` — parse both ways, verify same types/elements found
+#### Parser
+42. `testdata/parser/large_schema.xsd` — schema with 100+ types (verify all parsed correctly)
+43. `testdata/parser/location_test.xsd` — verify LocatingReader produces correct line/col in errors
+44. `testdata/parser/incremental_refs.xsd` — forward and backward type references resolved correctly
 
 Each test: parse XSD → assert model structure matches expectations.
 
@@ -1385,8 +1312,8 @@ This is critical for:
 //
 // 3. Document order is the canonical ordering.
 //    Elements, types, attributes, and compositors are stored in slices
-//    that preserve their order from the XSD source document. The streaming
-//    parser naturally produces events in document order.
+//    that preserve their order from the XSD source document. The
+//    xml.Decoder token loop naturally produces tokens in document order.
 //
 // 4. Name assignment happens in a single deterministic pass.
 //    Walk the schema in document order (depth-first). Assign names as
@@ -1395,8 +1322,8 @@ This is critical for:
 //
 // 5. Import/include order is deterministic.
 //    Imported schemas are processed in the order their <xs:import> elements
-//    appear in the importing schema. The FollowImportsHandler processes
-//    them synchronously in this order.
+//    appear in the importing schema. The parser handles them synchronously
+//    via recursive parseOne() calls in this order.
 //
 // 6. Cross-namespace naming uses namespace-prefixed disambiguation.
 //    If two namespaces both define "AddressType", they become
@@ -1459,14 +1386,14 @@ func TestNamedTypeUnchanged(t *testing.T)              // named types keep their
 func TestAnonymousTypeInListUnion(t *testing.T)        // list itemType, union memberTypes
 ```
 
-#### 3.0.7 Integration with Streaming Parser
+#### 3.0.7 Integration with Parser
 
-The naming system works on the completed model (after `CollectingHandler.Schema()`
-returns), not during streaming. However, the streaming parser's document-order
-preservation is what makes naming deterministic:
+The naming system works on the completed model (after `Parser.Parse()` returns),
+not during parsing. The parser's document-order preservation (via `xml.Decoder`
+token order) is what makes naming deterministic:
 
 ```
-Stream events (document order) → CollectingHandler (preserves order in slices)
+xml.Decoder tokens (document order) → Parser (preserves order in slices)
     → Schema model (slices = document order) → Namer (walks in document order)
     → NameMap (stable assignments) → CodeGen (uses NameMap for all type names)
 ```
@@ -2093,27 +2020,29 @@ goxsd3 generate \
 - [ ] `xsd/constraint.go` — Restriction, Facet, Assertion
 - [ ] Unit tests for model construction and traversal
 
-### Sprint 3: Streaming Parser (THE FOUNDATION)
-- [ ] `parser/streaming.go` — Event types, StreamHandler interface, StreamParser
-- [ ] StreamParser implementation using `encoding/xml` token reader
-- [ ] `slog` integration — structured logging for all parser events
-- [ ] Parse simple elements → emit EventElementStart/End → test: `simple_element.xsd`
-- [ ] Parse simpleType → emit EventSimpleTypeStart/End + EventFacet → test: `simple_type.xsd`
-- [ ] Parse complexType with sequence → emit compositor events → test: `complex_type.xsd`
-- [ ] Parse attributes → emit EventAttribute → test: `attributes.xsd`
-- [ ] Stream all 49 built-in types → test: `all_primitives.xsd`, `all_derived.xsd`
-- [ ] Tests: event ordering, depth tracking, location tracking
+### Sprint 3: LocatingReader & Parser Foundation
+- [ ] `parser/locate.go` — LocatingReader wrapping io.Reader with line/col tracking
+- [ ] LocatingReader tests: verify line/col for various byte offsets, multi-byte UTF-8
+- [ ] `parser/parser.go` — Parser struct, New(), Parse(), ParseReader()
+- [ ] xml.Decoder token loop with switch on StartElement/EndElement
+- [ ] `slog` integration — structured logging for parse events
+- [ ] Parse simple elements → build xsd.Element → test: `simple_element.xsd`
+- [ ] Parse simpleType → build xsd.SimpleType + facets → test: `simple_type.xsd`
+- [ ] Parse complexType with sequence → build compositor model → test: `complex_type.xsd`
+- [ ] Parse attributes → build xsd.Attribute → test: `attributes.xsd`
+- [ ] Error messages include file:line:col from LocatingReader
+- [ ] Tests: location accuracy, parse all 49 built-in types
 
-### Sprint 4: Handlers (Stream → DOM)
-- [ ] `parser/handler.go` — CollectingHandler, FilteringHandler, TypeListHandler, etc.
-- [ ] CollectingHandler: builds xsd.Schema from stream events
-- [ ] Incremental symbol table: connect type refs as definitions arrive
-- [ ] Forward reference resolution (pendingRefs list, resolved at end)
-- [ ] `parser/parser.go` — DOM parser as thin wrapper (StreamParser + CollectingHandler)
-- [ ] FilteringHandler — selective event forwarding
-- [ ] MultiHandler — fan-out to multiple handlers
-- [ ] Tests: `stream_vs_dom.xsd` — parse both ways, verify identical models
-- [ ] Tests: `large_schema.xsd` event counts, `filter_test.xsd`
+### Sprint 4: Symbol Table & Reference Resolution
+- [ ] SymbolTable: add types as they're parsed, O(1) lookup by QName
+- [ ] Incremental resolution: wire up type refs eagerly when definition already seen
+- [ ] Forward reference resolution (pendingRefs list, resolved after token loop)
+- [ ] `parser/resolve.go` — cross-schema type resolution
+- [ ] Import handling: synchronous recursive parse via SchemaResolver
+- [ ] Include handling: same-namespace merge
+- [ ] Visited set to prevent circular imports
+- [ ] Tests: `incremental_refs.xsd` — forward/backward refs resolved correctly
+- [ ] Tests: `large_schema.xsd` — 100+ types all parsed and resolved
 
 ### Sprint 5: Type Derivation, Facets & Validation
 - [ ] `config/validation.go` — ValidationConfig, ValidationLevel, ValidationRule types
@@ -2269,20 +2198,20 @@ goxsd3 generate \
 
 ## Key Design Decisions
 
-### 1. Streaming-First Parser
-The streaming parser is the foundation — the DOM parser is built on top via
-`CollectingHandler`. This ensures a single XML reading path, makes the streaming
-parser the most exercised code path, and enables use cases from fast introspection
-to full schema loading with the same battle-tested tokenizer.
+### 1. Direct xml.Decoder Parsing
+The parser uses `xml.Decoder` from the standard library in a simple token loop,
+building the schema model directly — no intermediate event types or handler
+abstractions. A `LocatingReader` wrapper tracks line/column numbers for precise
+error messages. This keeps the parser simple, easy to debug, and easy to extend.
 
 ### 2. Choice = Type Switch (not flat optional fields)
 Existing tools flatten choices into optional fields, losing type safety. We generate interfaces with a type switch, which is idiomatic Go and preserves the XSD semantics.
 
 ### 3. Incremental Reference Resolution
-As stream events arrive, type definitions are added to the symbol table immediately.
-References are resolved eagerly when possible, with forward references collected and
-resolved in a final pass. This means the DOM parser needs only one streaming pass
-plus a fast resolution sweep, not two full XML parses.
+As types are parsed from the xml.Decoder token loop, definitions are added to the
+symbol table immediately. References are resolved eagerly when possible, with forward
+references collected and resolved in a final pass. This means the parser needs only
+one token loop pass plus a fast resolution sweep, not two full XML parses.
 
 ### 4. No Concurrency
 The entire library is single-threaded. No goroutines anywhere in parsing, naming,
@@ -2331,7 +2260,7 @@ assignments.
 
 ### 12. Structured Logging with slog
 All components use `log/slog` for structured, leveled logging. Log groups
-(`parser.stream`, `parser.resolve`, `parser.import`, `parser.validate`)
+(`parser.parse`, `parser.resolve`, `parser.import`, `parser.validate`)
 provide fine-grained control. The logger is injected via Options, defaulting
 to `slog.Default()`.
 
@@ -2343,7 +2272,7 @@ to `slog.Default()`.
 - Model construction and traversal
 - Facet cross-validation (contradictory facets rejected)
 - Default/fixed value validation
-- Parser: one test per XSD construct (via streaming + DOM)
+- Parser: one test per XSD construct (with location accuracy checks)
 - Codegen: golden file comparison (both freeform and strict mode)
 - Marshallers: round-trip per format
 - Strict types: boundary value testing, invalid value rejection
@@ -2352,7 +2281,7 @@ to `slog.Default()`.
 - End-to-end: XSD file → parse → generate → compile → instantiate → marshal → unmarshal → compare
 - Cross-format: XML → JSON → XML round-trip
 - Multi-file schemas with imports
-- Stream vs DOM: parse same schema both ways, verify identical results
+- Multi-schema: parse with imports/includes, verify cross-schema resolution
 
 ### Public Conformance Tests
 
@@ -2408,8 +2337,7 @@ Each real-world schema test verifies:
 4. Import/include chains resolve correctly
 
 ### Benchmarks
-- Streaming parser throughput (events/sec on large schemas)
-- DOM parser performance (streaming + CollectingHandler)
+- Parser throughput (schemas/sec, types/sec on large schemas)
 - Codegen throughput
 - Marshal/unmarshal performance vs hand-written code
-- Memory usage: streaming vs DOM on large schemas
+- Memory usage on large schemas (100+ types, deep nesting)
