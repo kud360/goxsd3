@@ -527,14 +527,42 @@ The foundation — all other components depend on this.
 
 ### 1.1 Core Model Types (`xsd/model.go`)
 
+XSD parsing typically involves multiple schema documents (via `xs:import`,
+`xs:include`, `xs:redefine`, `xs:override`). Each document maps to a `Schema`,
+and the complete resolved result is a `SchemaSet`.
+
 ```go
 package xsd
 
-// Schema is the root of a parsed XSD.
+// SchemaSet is the fully resolved result of parsing one or more XSD documents.
+// It contains all schemas (each from a distinct document/namespace) with all
+// cross-schema references resolved. This is the primary input to code generation.
+//
+// Schemas are stored in parse order (the order in which the parser first
+// encountered each document). This ensures deterministic code generation.
+type SchemaSet struct {
+    Schemas []*Schema              // parse order (stable iteration)
+    // Internal indexes — for O(1) cross-schema lookup, NEVER iterated for output.
+    byNamespace map[string]*Schema // namespace → schema
+    allTypes    map[QName]Type     // {ns, local} → type (across all schemas)
+}
+
+// LookupType finds a type by QName across all schemas in the set.
+func (ss *SchemaSet) LookupType(name QName) Type
+
+// LookupElement finds a global element by namespace + name across all schemas.
+func (ss *SchemaSet) LookupElement(ns, name string) *Element
+
+// Schema represents a single parsed XSD document.
+// A schema document may import/include other documents, but this struct
+// holds only the declarations from one document. Cross-document references
+// are resolved at the SchemaSet level.
+//
 // STABILITY: All slices preserve document order. Maps are for O(1) lookup only
 // and are NEVER iterated for output. This ensures deterministic code generation.
 type Schema struct {
     TargetNamespace string
+    Location        string            // source file path or URI (systemID)
     Namespaces      map[string]string // prefix → URI (lookup only)
     Elements        []*Element        // document order (stable iteration)
     Types           []Type            // document order (stable iteration)
@@ -563,6 +591,7 @@ type Element struct {
     InlineType       Type // anonymous type defined inline
     Annotations      []*Annotation
     Alternatives     []*Alternative // XSD 1.1
+    Location         Location       // where this element was defined
 }
 
 type Attribute struct {
@@ -573,6 +602,7 @@ type Attribute struct {
     Fixed       *string
     Inheritable bool // XSD 1.1
     Annotations []*Annotation
+    Location    Location // where this attribute was defined
 }
 ```
 
@@ -824,28 +854,46 @@ package parser
 type Parser struct {
     opts       Options
     hooks      []Hook
-    schemas    map[string]*xsd.Schema // namespace → schema
-    symbols    SymbolTable
+    schemas    []*xsd.Schema          // parse order (stable)
+    schemaMap  map[string]*xsd.Schema // namespace → schema (lookup only)
+    symbols    SymbolTable            // shared across all documents
+    visited    map[string]bool        // resolved URIs already parsed (prevents circular imports)
     logger     *slog.Logger
 }
 
 func New(opts ...Option) *Parser
 
-// Parse parses one or more XSD files and returns the resolved schema set.
+// Parse parses one or more XSD entry-point files and returns the fully resolved
+// schema set. Each file is parsed as a separate document. Imported/included
+// schemas are discovered and parsed recursively during the process.
 func (p *Parser) Parse(files ...string) (*xsd.SchemaSet, error)
 
-// ParseReader parses from an io.Reader.
+// ParseReader parses from an io.Reader as a single entry-point document.
 func (p *Parser) ParseReader(r io.Reader, systemID string) (*xsd.SchemaSet, error)
 
-// parseOne reads a single XSD document using xml.Decoder and builds
-// the schema model directly.
+// parseOne reads a single XSD document using xml.Decoder and builds one
+// xsd.Schema. It may recursively call itself for xs:import/xs:include.
+// All parsed schemas share the same SymbolTable for cross-document resolution.
 func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error)
 
 // Parse implementation (pseudocode):
+// func (p *Parser) Parse(files ...string) (*xsd.SchemaSet, error) {
+//     for _, file := range files {
+//         f, _ := os.Open(file)
+//         if _, err := p.parseOne(f, file); err != nil { return nil, err }
+//     }
+//     // All documents parsed. Resolve any remaining cross-document references.
+//     if err := p.resolveAll(); err != nil { return nil, err }
+//     return &xsd.SchemaSet{Schemas: p.schemas}, nil
+// }
+//
 // func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error) {
+//     if p.visited[systemID] { return p.schemaMap[ns], nil } // already parsed
+//     p.visited[systemID] = true
+//
 //     lr := NewLocatingReader(r)
 //     dec := xml.NewDecoder(lr)
-//     schema := &xsd.Schema{}
+//     schema := &xsd.Schema{Location: systemID}
 //     var stack []buildContext
 //     var pendingRefs []pendingRef
 //
@@ -876,42 +924,61 @@ func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error)
 //             case "attribute":
 //                 attr := p.buildAttribute(t.Attr, loc)
 //             case "import":
-//                 // Synchronously resolve and parse the imported schema
-//                 p.handleImport(t.Attr, loc)
+//                 // Resolve the imported schema and parse it recursively.
+//                 // This adds the imported schema's types to p.symbols,
+//                 // making them available for reference resolution in THIS document.
+//                 data, _ := p.opts.Resolver.Resolve(schemaLocation, systemID, namespace)
+//                 p.parseOne(bytes.NewReader(data), resolvedURI)
 //             case "include":
-//                 p.handleInclude(t.Attr, loc)
+//                 // Same as import but merges into current schema's namespace.
+//                 // Chameleon includes adopt the includer's targetNamespace.
+//                 p.handleInclude(t.Attr, loc, schema)
 //             // ... restriction, extension, facets, groups, etc.
 //             }
 //         case xml.EndElement:
 //             // pop stack, finalize current construct
 //         }
 //     }
-//     // Resolve forward references
+//
+//     // Resolve within-document forward references
 //     for _, ref := range pendingRefs {
 //         if typ := p.symbols.Lookup(ref.qname); typ != nil {
 //             ref.setter(typ)
-//         } else {
-//             return nil, fmt.Errorf("%s: unresolved type %q", ref.location, ref.qname)
 //         }
+//         // Cross-document refs that are still unresolved stay in p.pendingRefs
+//         // for the final resolveAll() pass.
 //     }
+//
+//     p.schemas = append(p.schemas, schema)
+//     p.schemaMap[schema.TargetNamespace] = schema
 //     return schema, nil
 // }
 ```
 
+**Multi-document parsing flow:**
+1. The user calls `Parse("main.xsd")` with one or more entry-point files
+2. `parseOne()` reads a single document, building one `xsd.Schema`
+3. When `<xs:import>` or `<xs:include>` is encountered mid-parse, the parser
+   synchronously resolves the referenced schema via `SchemaResolver` and
+   recursively calls `parseOne()` — the imported schema's types become
+   available in the shared `SymbolTable` before parsing of the current
+   document continues
+4. A `visited` set (keyed by resolved URI) prevents circular imports
+5. After all documents are parsed, `resolveAll()` does a final sweep to
+   resolve any remaining cross-document forward references
+6. The result is a `SchemaSet` containing all parsed `Schema` objects in
+   parse order, with all cross-schema type references fully wired up
+
 **Incremental resolution strategy:**
 1. As `complexType`/`simpleType` start elements are parsed, definitions are
-   added to the symbol table immediately
+   added to the shared symbol table immediately
 2. When a `type="..."` or `base="..."` reference is encountered, check the symbol
    table — if found, wire it up immediately; if not, add to `pendingRefs`
-3. After the token loop completes, resolve all `pendingRefs` (forward references)
-4. Any remaining unresolved refs are errors (unless from imported namespaces
-   that haven't been loaded yet)
-
-**Import/include handling:**
-When the parser encounters `<xs:import>` or `<xs:include>`, it synchronously
-resolves the schema via `SchemaResolver`, parses it recursively with `parseOne()`,
-and merges the resulting types into the symbol table. A `visited` set prevents
-circular imports. Everything is synchronous — no goroutines.
+3. Because imports are parsed recursively inline, most cross-document references
+   resolve eagerly (the imported schema is fully parsed before the referencing
+   element finishes)
+4. After all documents are parsed, `resolveAll()` handles any remaining unresolved
+   refs (e.g., circular cross-namespace references)
 
 ### 2.3 Import/Include Resolution (Deep Dive)
 
