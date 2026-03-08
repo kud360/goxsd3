@@ -77,6 +77,7 @@ goxsd3/
 │   └── hooks.go         # Parser hook interfaces
 ├── codegen/             # Go code generation (model → Go source)
 │   ├── codegen.go       # Main code generator
+│   ├── naming.go        # Contextual naming system (anonymous type names)
 │   ├── types.go         # Type mapping (XSD → Go)
 │   ├── choice.go        # Choice → interface + type switch
 │   ├── templates/       # text/template files
@@ -104,6 +105,7 @@ goxsd3/
     ├── nested/          # Deeply nested compositor tests
     ├── streaming/       # Streaming parser test fixtures
     ├── xsd11/
+    ├── naming/          # Anonymous type naming tests
     ├── w3c/             # W3C XSD Test Suite (XSTS) subset
     └── realworld/       # Real-world schemas (SOAP, GPX, KML, XBRL, etc.)
 ```
@@ -530,16 +532,23 @@ The foundation — all other components depend on this.
 package xsd
 
 // Schema is the root of a parsed XSD.
+// STABILITY: All slices preserve document order. Maps are for O(1) lookup only
+// and are NEVER iterated for output. This ensures deterministic code generation.
 type Schema struct {
     TargetNamespace string
-    Namespaces      map[string]string // prefix → URI
-    Elements        []*Element
-    Types           []Type           // SimpleType | ComplexType
-    Groups          []*Group
-    AttributeGroups []*AttributeGroup
-    Imports         []*Import
-    Includes        []*Include
-    Annotations     []*Annotation
+    Namespaces      map[string]string // prefix → URI (lookup only)
+    Elements        []*Element        // document order (stable iteration)
+    Types           []Type            // document order (stable iteration)
+    Groups          []*Group          // document order
+    AttributeGroups []*AttributeGroup // document order
+    Imports         []*Import         // document order
+    Includes        []*Include        // document order
+    Annotations     []*Annotation     // document order
+
+    // Internal indexes — for O(1) lookup, NEVER iterated for output.
+    elementIndex map[string]*Element  // name → element
+    typeIndex    map[QName]Type       // qname → type
+    groupIndex   map[string]*Group    // name → group
 }
 
 type Element struct {
@@ -1168,6 +1177,233 @@ Each test: parse XSD → assert model structure matches expectations.
 
 ## Phase 3: Code Generator (Model → Go Source)
 
+### 3.0 Contextual Naming System (`codegen/naming.go`)
+
+Anonymous (inline) types in XSD have no `name` attribute — they must be assigned
+stable, human-readable Go names during code generation. This is a critical system
+that must be **deterministic** (same input always produces same output) and
+**conflict-free** (no two types get the same Go name).
+
+#### 3.0.1 The Problem
+
+```xml
+<!-- Named type: easy, just use "AddressType" -->
+<xs:complexType name="AddressType">...</xs:complexType>
+
+<!-- Anonymous type: needs a generated name -->
+<xs:element name="order">
+  <xs:complexType>                    <!-- What Go name? -->
+    <xs:sequence>
+      <xs:element name="item">
+        <xs:complexType>              <!-- What Go name? Nested anonymous! -->
+          <xs:sequence>
+            <xs:element name="details">
+              <xs:simpleType>         <!-- What Go name? 3 levels deep! -->
+                <xs:restriction base="xs:string">
+                  <xs:maxLength value="100"/>
+                </xs:restriction>
+              </xs:simpleType>
+            </xs:element>
+          </xs:sequence>
+        </xs:complexType>
+      </xs:element>
+    </xs:sequence>
+  </xs:complexType>
+</xs:element>
+```
+
+#### 3.0.2 Naming Strategy
+
+Names are derived from the **definition context** — the path of containing
+elements/types from the schema root to the anonymous definition.
+
+**Priority order for name derivation:**
+1. **Named type**: use the `name` attribute directly → `AddressType`
+2. **Anonymous type in element**: `{ElementName}Type` → `OrderType`
+3. **Anonymous type in attribute**: `{AttributeName}Type` → `CurrencyType`
+4. **Nested anonymous in element chain**: join parent names → `OrderItemType`, `OrderItemDetailsType`
+5. **Anonymous in choice variant**: `{ParentType}{ElementName}Type` → `ShapeCircleType`
+6. **Anonymous in group**: `{GroupName}{ElementName}Type` → `AddressFieldsStreetType`
+7. **Anonymous in restriction/extension**: `{ParentType}BaseType` or use parent name
+
+```go
+package codegen
+
+// Namer assigns stable Go names to all types in a schema.
+type Namer struct {
+    registry  map[string]namedEntry  // Go name → source (for conflict detection)
+    usedNames map[string]bool        // all assigned names
+    logger    *slog.Logger
+}
+
+type namedEntry struct {
+    GoName   string
+    Source   namingSource  // what produced this name
+    XSDPath  []string      // element/type path from schema root
+}
+
+type namingSource int
+const (
+    sourceNamed      namingSource = iota // explicit XSD name attribute
+    sourceElement                         // derived from parent element name
+    sourceAttribute                       // derived from parent attribute name
+    sourceCompositor                      // derived from compositor context
+    sourceConflict                        // renamed due to conflict
+)
+
+// AssignNames walks the schema model and assigns Go names to all types.
+// This is called once before code generation begins.
+// Returns a map from model pointer → Go name.
+func (n *Namer) AssignNames(schema *xsd.SchemaSet) (*NameMap, error)
+
+// NameMap provides O(1) lookup from any Type/Element to its assigned Go name.
+type NameMap struct {
+    types    map[xsd.Type]string
+    elements map[*xsd.Element]string
+}
+
+func (m *NameMap) TypeName(t xsd.Type) string
+func (m *NameMap) ElementName(e *xsd.Element) string
+```
+
+#### 3.0.3 Conflict Resolution
+
+When two anonymous types would produce the same Go name, conflicts are resolved
+deterministically:
+
+```go
+// Conflict resolution strategy (in order):
+// 1. Try the base name: "OrderType"
+// 2. If conflict, qualify with parent: "MainOrderType" vs "LegacyOrderType"
+// 3. If still conflict, qualify with grandparent: "SchemaMainOrderType"
+// 4. If still conflict (extremely rare), append numeric suffix: "OrderType2"
+//    Suffix is assigned by document order (first occurrence gets no suffix).
+
+// Example conflicts:
+// <xs:element name="order">           → OrderType
+//   <xs:complexType>...</xs:complexType>
+// </xs:element>
+// <xs:element name="legacyOrder">
+//   <xs:complexType>
+//     <xs:sequence>
+//       <xs:element name="order">     → LegacyOrderOrderType (qualified with parent)
+//         <xs:complexType>...</xs:complexType>
+//       </xs:element>
+//     </xs:sequence>
+//   </xs:complexType>
+// </xs:element>
+```
+
+#### 3.0.4 Determinism & Stability Requirements
+
+**The naming system MUST produce identical output for identical input, every time.**
+This is critical for:
+- Generated code that's checked into version control (no spurious diffs)
+- Reproducible builds
+- Stable API surfaces (renamed types break downstream consumers)
+
+**Rules for deterministic processing:**
+
+```go
+// STABILITY RULES — enforced throughout parser, namer, and codegen:
+//
+// 1. NO map iteration for ordered output.
+//    Maps are used for O(1) lookup only. When order matters, iterate
+//    over the source slice (which preserves document order) and look up
+//    in the map.
+//
+// 2. Document order is the canonical ordering.
+//    Elements, types, attributes, and compositors are stored in slices
+//    that preserve their order from the XSD source document. The streaming
+//    parser naturally produces events in document order.
+//
+// 3. Name assignment happens in a single deterministic pass.
+//    Walk the schema in document order (depth-first). Assign names as
+//    encountered. First occurrence wins (no suffix). Later conflicts get
+//    qualified names or suffixes.
+//
+// 4. Import/include order is deterministic.
+//    Imported schemas are processed in the order their <xs:import> elements
+//    appear in the importing schema. The FollowImportsHandler processes
+//    them in this order.
+//
+// 5. No goroutine-dependent ordering.
+//    Even if parsing uses concurrency internally, the output model must
+//    be assembled in a deterministic order.
+//
+// 6. Cross-namespace naming uses namespace-prefixed disambiguation.
+//    If two namespaces both define "AddressType", they become
+//    "AddressType" and "Ns2AddressType" (or user-configured prefix).
+```
+
+**Data structures for stable iteration:**
+
+```go
+// OrderedMap preserves insertion order while providing O(1) lookup.
+// Used throughout the codebase where both ordering and lookup are needed.
+type OrderedMap[K comparable, V any] struct {
+    keys   []K          // insertion order
+    values map[K]V      // O(1) lookup
+}
+
+func (m *OrderedMap[K, V]) Set(key K, value V)
+func (m *OrderedMap[K, V]) Get(key K) (V, bool)
+func (m *OrderedMap[K, V]) Keys() []K           // returns keys in insertion order
+func (m *OrderedMap[K, V]) Range(fn func(K, V)) // iterates in insertion order
+
+// Usage in Schema model:
+type Schema struct {
+    // ...
+    // Types are stored as a slice (document order) + map (O(1) lookup by QName).
+    Types     []Type                    // document order
+    typeIndex map[QName]Type            // O(1) lookup (NOT iterated)
+}
+```
+
+#### 3.0.5 Naming Edge Cases
+
+| XSD Pattern | Generated Name | Notes |
+|---|---|---|
+| `<xs:element name="person"><xs:complexType>...` | `PersonType` | Element name + "Type" |
+| `<xs:element name="address"><xs:complexType>` inside `PersonType` | `PersonAddressType` | Parent + element |
+| `<xs:element name="line"><xs:simpleType>` inside `PersonAddressType` | `PersonAddressLineType` | Full path |
+| Anonymous type in `<xs:choice>` variant | `{ChoiceParent}{VariantElement}Type` | Choice context |
+| Anonymous type in `<xs:group name="Foo">` | `Foo{Element}Type` | Group context |
+| Anonymous type in `<xs:restriction>` | Inherits parent's name context | No extra nesting |
+| Anonymous type in `<xs:list itemType>` | `{ParentType}ItemType` | List item |
+| Anonymous type in `<xs:union>` | `{ParentType}Member{N}Type` | Union member (N=1,2,...) |
+| Two elements named "item" at different nesting | `ItemType`, `OrderItemType` | Conflict resolution |
+| Cross-namespace same name | `AddressType`, `Ns2AddressType` | Namespace prefix |
+
+#### 3.0.6 Naming Tests
+
+```go
+func TestSimpleAnonymousTypeName(t *testing.T)        // element → ElementType
+func TestNestedAnonymousTypeName(t *testing.T)         // parent.child → ParentChildType
+func TestDeeplyNestedAnonymousTypeName(t *testing.T)   // 4+ levels deep
+func TestConflictResolutionQualify(t *testing.T)       // same base name, different parents
+func TestConflictResolutionSuffix(t *testing.T)        // truly identical paths (rare)
+func TestNamingDeterminism(t *testing.T)               // parse same schema 100x, verify same names
+func TestNamingStabilityAcrossRuns(t *testing.T)       // serialize names, compare across runs
+func TestAnonymousTypeInChoice(t *testing.T)           // choice variant naming
+func TestAnonymousTypeInGroup(t *testing.T)            // group element naming
+func TestCrossNamespaceNaming(t *testing.T)            // namespace-prefixed disambiguation
+func TestNamedTypeUnchanged(t *testing.T)              // named types keep their XSD name
+func TestAnonymousTypeInListUnion(t *testing.T)        // list itemType, union memberTypes
+```
+
+#### 3.0.7 Integration with Streaming Parser
+
+The naming system works on the completed model (after `CollectingHandler.Schema()`
+returns), not during streaming. However, the streaming parser's document-order
+preservation is what makes naming deterministic:
+
+```
+Stream events (document order) → CollectingHandler (preserves order in slices)
+    → Schema model (slices = document order) → Namer (walks in document order)
+    → NameMap (stable assignments) → CodeGen (uses NameMap for all type names)
+```
+
 ### 3.1 Type Mapping Strategy — Strict vs Freeform Types
 
 Users can choose between two type modes (or mix them per-type):
@@ -1694,7 +1930,17 @@ goxsd3 generate \
 - [ ] Parse each real-world schema without error
 - [ ] Verify type counts and element counts match expectations
 
-### Sprint 10: Strict Type Library (`xsdtypes/`)
+### Sprint 10: Contextual Naming System
+- [ ] `codegen/naming.go` — Namer, NameMap, conflict detection
+- [ ] Name derivation from element/attribute/group context path
+- [ ] Conflict resolution: qualify with parent, then grandparent, then numeric suffix
+- [ ] `OrderedMap[K, V]` generic type for stable iteration + O(1) lookup
+- [ ] Audit all map usage in parser/codegen: maps used for lookup only, never iterated
+- [ ] Determinism tests: parse same schema N times, verify identical name assignments
+- [ ] Naming edge case tests (see Phase 3.0.6)
+- [ ] Cross-namespace disambiguation tests
+
+### Sprint 11: Strict Type Library (`xsdtypes/`)
 - [ ] `xsdtypes/` package — strict wrapper types for built-in XSD types
 - [ ] Duration, Date, Time, GYear, GYearMonth, GMonthDay, GDay, GMonth
 - [ ] HexBinary, AnyURI, Decimal, Integer, QName
@@ -1703,22 +1949,24 @@ goxsd3 generate \
 - [ ] `slog.Warn` integration for ValidationWarn level
 - [ ] Tests for each strict type: valid values, boundary values, invalid values
 
-### Sprint 11: Basic Code Generation (Freeform Mode)
+### Sprint 12: Basic Code Generation (Freeform Mode)
+- [ ] `codegen/naming.go` integrated — Namer runs before codegen
 - [ ] Type mapping (XSD built-in → Go, using BuiltinRegistry.GoType)
 - [ ] Struct generation from complexType + sequence
+- [ ] Anonymous type naming via Namer + NameMap
 - [ ] Pointer/slice for optional/repeated
 - [ ] User-defined simpleType → named Go type alias (freeform, no validation)
 - [ ] `go/format` integration
 - [ ] Golden file tests
 
-### Sprint 12: Strict Mode Code Generation
+### Sprint 13: Strict Mode Code Generation
 - [ ] Generate strict wrapper types with New*/Must* constructors
 - [ ] Generate validation functions based on facets
 - [ ] Per-rule validation strictness in generated code
 - [ ] TypeModeMixed: per-type strict/freeform selection
 - [ ] Golden file tests (strict mode variants)
 
-### Sprint 13: Choice Code Generation
+### Sprint 14: Choice Code Generation
 - [ ] Interface + concrete types for `xs:choice`
 - [ ] Type switch marshal/unmarshal generation
 - [ ] Nested choice → nested interfaces / flattened where possible
@@ -1726,44 +1974,44 @@ goxsd3 generate \
 - [ ] Choice-in-sequence → interface field
 - [ ] Tests with compilation check
 
-### Sprint 14: Full Codegen
+### Sprint 15: Full Codegen
 - [ ] Enum generation (typed string constants)
 - [ ] Extension → embedded struct (ComplexType inheritance)
 - [ ] Group inlining
 - [ ] Any → `any` / `xml.Token`
 - [ ] Golden file tests for all
 
-### Sprint 15: XML Marshallers
+### Sprint 16: XML Marshallers
 - [ ] Generate `MarshalXML` / `UnmarshalXML`
 - [ ] Choice type switch in marshaller
 - [ ] Namespace handling
 - [ ] Strict mode: validation during unmarshal (per-rule config)
 - [ ] Round-trip tests
 
-### Sprint 16: JSON Marshallers
+### Sprint 17: JSON Marshallers
 - [ ] Generate `MarshalJSON` / `UnmarshalJSON`
 - [ ] Discriminated union for choice types
 - [ ] Round-trip tests
 
-### Sprint 17: BER Marshallers
+### Sprint 18: BER Marshallers
 - [ ] ASN.1 type mapping
 - [ ] Generate BER marshal/unmarshal
 - [ ] Round-trip tests
 
-### Sprint 18: XSD 1.1 Features
+### Sprint 19: XSD 1.1 Features
 - [ ] Assertions (`xs:assert`) — store in model, optionally generate validation
 - [ ] Conditional type assignment (`xs:alternative`)
 - [ ] Open content (`xs:openContent`)
 - [ ] Enhanced wildcards
 - [ ] Tests for each
 
-### Sprint 19: Plugin System
+### Sprint 20: Plugin System
 - [ ] Hook interfaces finalized
 - [ ] Plugin registry
 - [ ] Sample plugins (rename, custom tags, validation)
 - [ ] Plugin tests
 
-### Sprint 20: CLI & Polish
+### Sprint 21: CLI & Polish
 - [ ] CLI with flag parsing (including `--type-mode`, `--validation`)
 - [ ] `slog` handler configuration via CLI (`--log-level`, `--log-format`)
 - [ ] End-to-end integration tests
@@ -1808,7 +2056,15 @@ Four hook points: Parser → Model → Codegen → Marshal. Each hook can modify
 ### 7. BER via Struct Tags
 Generate ASN.1 struct tags on the same Go types, so a single struct can marshal to XML, JSON, and BER. Use `asn1:"..."` tags alongside `xml:"..."` and `json:"..."`.
 
-### 8. Structured Logging with slog
+### 8. Deterministic Contextual Naming
+Anonymous types are named from their definition context (containing element/type path).
+Conflicts are resolved by qualifying with parent names, then numeric suffixes. All
+data structures preserve document order — maps are used for O(1) lookup only, never
+iterated for output. The `OrderedMap[K,V]` generic type enforces this pattern.
+Determinism is tested: same schema parsed N times must produce identical name
+assignments.
+
+### 9. Structured Logging with slog
 All components use `log/slog` for structured, leveled logging. Log groups
 (`parser.stream`, `parser.resolve`, `parser.import`, `parser.validate`)
 provide fine-grained control. The logger is injected via Options, defaulting
