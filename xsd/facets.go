@@ -39,101 +39,52 @@ type Facet struct {
 	Fixed bool
 }
 
+// Shared facet lists used by multiple type families.
+var (
+	// lengthFacets are applicable to string-like and binary types.
+	lengthFacets = []FacetKind{
+		FacetLength, FacetMinLength, FacetMaxLength,
+		FacetPattern, FacetEnumeration, FacetWhiteSpace,
+	}
+	// orderedFacets are applicable to ordered types (date/time, float, duration).
+	orderedFacets = []FacetKind{
+		FacetPattern, FacetEnumeration, FacetWhiteSpace,
+		FacetMaxInclusive, FacetMaxExclusive,
+		FacetMinInclusive, FacetMinExclusive,
+	}
+)
+
 // facetApplicability maps each type family name to the set of facets that may
 // be applied to types belonging to that family.
 var facetApplicability = map[string][]FacetKind{
-	"string": {
-		FacetLength, FacetMinLength, FacetMaxLength,
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-	},
-	"boolean": {
-		FacetPattern, FacetWhiteSpace,
-	},
+	"string":       lengthFacets,
+	"hexBinary":    lengthFacets,
+	"base64Binary": lengthFacets,
+	"anyURI":       lengthFacets,
+	"QName":        lengthFacets,
+	"NOTATION":     lengthFacets,
+	"list":         lengthFacets,
+
+	"boolean": {FacetPattern, FacetWhiteSpace},
+
 	"decimal": {
 		FacetPattern, FacetEnumeration, FacetWhiteSpace,
 		FacetMaxInclusive, FacetMaxExclusive,
 		FacetMinInclusive, FacetMinExclusive,
 		FacetTotalDigits, FacetFractionDigits,
 	},
-	"float": {
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-		FacetMaxInclusive, FacetMaxExclusive,
-		FacetMinInclusive, FacetMinExclusive,
-	},
-	"double": {
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-		FacetMaxInclusive, FacetMaxExclusive,
-		FacetMinInclusive, FacetMinExclusive,
-	},
-	"duration": {
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-		FacetMaxInclusive, FacetMaxExclusive,
-		FacetMinInclusive, FacetMinExclusive,
-	},
-	"dateTime": {
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-		FacetMaxInclusive, FacetMaxExclusive,
-		FacetMinInclusive, FacetMinExclusive,
-	},
-	"time": {
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-		FacetMaxInclusive, FacetMaxExclusive,
-		FacetMinInclusive, FacetMinExclusive,
-	},
-	"date": {
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-		FacetMaxInclusive, FacetMaxExclusive,
-		FacetMinInclusive, FacetMinExclusive,
-	},
-	"gYearMonth": {
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-		FacetMaxInclusive, FacetMaxExclusive,
-		FacetMinInclusive, FacetMinExclusive,
-	},
-	"gYear": {
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-		FacetMaxInclusive, FacetMaxExclusive,
-		FacetMinInclusive, FacetMinExclusive,
-	},
-	"gMonthDay": {
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-		FacetMaxInclusive, FacetMaxExclusive,
-		FacetMinInclusive, FacetMinExclusive,
-	},
-	"gDay": {
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-		FacetMaxInclusive, FacetMaxExclusive,
-		FacetMinInclusive, FacetMinExclusive,
-	},
-	"gMonth": {
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-		FacetMaxInclusive, FacetMaxExclusive,
-		FacetMinInclusive, FacetMinExclusive,
-	},
-	"hexBinary": {
-		FacetLength, FacetMinLength, FacetMaxLength,
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-	},
-	"base64Binary": {
-		FacetLength, FacetMinLength, FacetMaxLength,
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-	},
-	"anyURI": {
-		FacetLength, FacetMinLength, FacetMaxLength,
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-	},
-	"QName": {
-		FacetLength, FacetMinLength, FacetMaxLength,
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-	},
-	"NOTATION": {
-		FacetLength, FacetMinLength, FacetMaxLength,
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-	},
-	"list": {
-		FacetLength, FacetMinLength, FacetMaxLength,
-		FacetPattern, FacetEnumeration, FacetWhiteSpace,
-	},
+
+	"float":      orderedFacets,
+	"double":     orderedFacets,
+	"duration":   orderedFacets,
+	"dateTime":   orderedFacets,
+	"time":       orderedFacets,
+	"date":       orderedFacets,
+	"gYearMonth": orderedFacets,
+	"gYear":      orderedFacets,
+	"gMonthDay":  orderedFacets,
+	"gDay":       orderedFacets,
+	"gMonth":     orderedFacets,
 }
 
 // FacetApplicability returns the facets that are applicable to the given type

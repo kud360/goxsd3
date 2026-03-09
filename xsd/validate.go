@@ -23,17 +23,12 @@ func ValidateDefaultValue(value string, typeName QName, registry *BuiltinRegistr
 
 	local := typeName.Local
 
-	switch {
-	// String family — always valid.
-	case info.Family == "string" ||
-		local == "string" || local == "normalizedString" || local == "token" ||
-		local == "language" || local == "Name" || local == "NCName" ||
-		local == "NMTOKEN" || local == "NMTOKENS" ||
-		local == "ID" || local == "IDREF" || local == "IDREFS" ||
-		local == "ENTITY" || local == "ENTITIES" ||
-		local == "NOTATION":
+	// String family and list types — any value is valid.
+	if info.Family == "string" || info.Family == "list" || local == "NOTATION" {
 		return nil
+	}
 
+	switch {
 	// Boolean
 	case local == "boolean":
 		if !isValidBoolean(value) {
@@ -42,10 +37,7 @@ func ValidateDefaultValue(value string, typeName QName, registry *BuiltinRegistr
 		return nil
 
 	// Integer and derived integer types (no decimal point allowed).
-	case local == "integer" || local == "nonPositiveInteger" || local == "negativeInteger" ||
-		local == "nonNegativeInteger" || local == "positiveInteger" ||
-		local == "long" || local == "int" || local == "short" || local == "byte" ||
-		local == "unsignedLong" || local == "unsignedInt" || local == "unsignedShort" || local == "unsignedByte":
+	case info.Family == "decimal" && local != "decimal":
 		if !isValidInteger(value) {
 			return fmt.Errorf("invalid integer value %q for type %s", value, local)
 		}
@@ -59,31 +51,18 @@ func ValidateDefaultValue(value string, typeName QName, registry *BuiltinRegistr
 		return nil
 
 	// Float / double.
-	case local == "float" || local == "double":
+	case info.Family == "float" || info.Family == "double":
 		if !isValidFloat(value) {
 			return fmt.Errorf("invalid %s value %q", local, value)
 		}
 		return nil
 
 	// dateTime family — basic format check.
-	case local == "dateTime" || local == "date" || local == "time" ||
-		local == "gYear" || local == "gYearMonth" || local == "gMonth" ||
-		local == "gMonthDay" || local == "gDay" || local == "duration":
-		if strings.TrimSpace(value) == "" {
-			return fmt.Errorf("invalid %s value: empty string", local)
-		}
-		// Basic sanity: must contain at least a digit.
-		hasDigit := false
-		for _, r := range value {
-			if unicode.IsDigit(r) {
-				hasDigit = true
-				break
-			}
-		}
-		if !hasDigit {
-			return fmt.Errorf("invalid %s value %q: expected ISO 8601 format", local, value)
-		}
-		return nil
+	case info.Family == "duration" ||
+		info.Family == "dateTime" || info.Family == "time" || info.Family == "date" ||
+		info.Family == "gYear" || info.Family == "gYearMonth" || info.Family == "gMonth" ||
+		info.Family == "gMonthDay" || info.Family == "gDay":
+		return validateDateTimeLike(value, local)
 
 	// hexBinary
 	case local == "hexBinary":
@@ -117,90 +96,85 @@ func ValidateDefaultValue(value string, typeName QName, registry *BuiltinRegistr
 	return nil
 }
 
+// validateDateTimeLike performs basic sanity checking on date/time/duration values.
+func validateDateTimeLike(value, local string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("invalid %s value: empty string", local)
+	}
+	for _, r := range value {
+		if unicode.IsDigit(r) {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid %s value %q: expected ISO 8601 format", local, value)
+}
+
+// integerRange defines the valid range for an integer subtype.
+type integerRange struct {
+	min      int64
+	max      int64
+	unsigned bool
+	umax     uint64
+}
+
+// integerRanges maps XSD integer subtypes to their valid ranges.
+var integerRanges = map[string]integerRange{
+	"long":            {min: math.MinInt64, max: math.MaxInt64},
+	"int":             {min: math.MinInt32, max: math.MaxInt32},
+	"short":           {min: math.MinInt16, max: math.MaxInt16},
+	"byte":            {min: math.MinInt8, max: math.MaxInt8},
+	"unsignedLong":    {unsigned: true, umax: math.MaxUint64},
+	"unsignedInt":     {unsigned: true, umax: math.MaxUint32},
+	"unsignedShort":   {unsigned: true, umax: math.MaxUint16},
+	"unsignedByte":    {unsigned: true, umax: math.MaxUint8},
+	"positiveInteger": {min: 1, max: math.MaxInt64},
+}
+
 // validateIntegerRange checks that value fits within the range of the named
 // integer subtype. The caller has already verified that value is a valid integer.
 func validateIntegerRange(value, local string) error {
-	switch local {
-	case "long":
-		_, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return fmt.Errorf("value %q out of range for long", value)
+	r, ok := integerRanges[local]
+	if !ok {
+		// Handle special cases not expressible as simple ranges.
+		switch local {
+		case "nonNegativeInteger":
+			if strings.HasPrefix(value, "-") && value != "-0" {
+				return fmt.Errorf("value %q out of range for nonNegativeInteger (must be >= 0)", value)
+			}
+		case "negativeInteger":
+			v, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return fmt.Errorf("value %q is not a valid negativeInteger", value)
+			}
+			if v >= 0 {
+				return fmt.Errorf("value %q out of range for negativeInteger (must be < 0)", value)
+			}
+		case "nonPositiveInteger":
+			v, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return fmt.Errorf("value %q is not a valid nonPositiveInteger", value)
+			}
+			if v > 0 {
+				return fmt.Errorf("value %q out of range for nonPositiveInteger (must be <= 0)", value)
+			}
 		}
-	case "int":
-		v, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || v < math.MinInt32 || v > math.MaxInt32 {
-			return fmt.Errorf("value %q out of range for int (-2147483648 to 2147483647)", value)
-		}
-	case "short":
-		v, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || v < math.MinInt16 || v > math.MaxInt16 {
-			return fmt.Errorf("value %q out of range for short (-32768 to 32767)", value)
-		}
-	case "byte":
-		v, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || v < math.MinInt8 || v > math.MaxInt8 {
-			return fmt.Errorf("value %q out of range for byte (-128 to 127)", value)
-		}
-	case "unsignedLong":
+		return nil
+	}
+
+	if r.unsigned {
 		if strings.HasPrefix(value, "-") {
-			return fmt.Errorf("value %q out of range for unsignedLong", value)
-		}
-		_, err := strconv.ParseUint(value, 10, 64)
-		if err != nil {
-			return fmt.Errorf("value %q out of range for unsignedLong", value)
-		}
-	case "unsignedInt":
-		if strings.HasPrefix(value, "-") {
-			return fmt.Errorf("value %q out of range for unsignedInt", value)
+			return fmt.Errorf("value %q out of range for %s", value, local)
 		}
 		v, err := strconv.ParseUint(value, 10, 64)
-		if err != nil || v > math.MaxUint32 {
-			return fmt.Errorf("value %q out of range for unsignedInt (0 to 4294967295)", value)
+		if err != nil || v > r.umax {
+			return fmt.Errorf("value %q out of range for %s", value, local)
 		}
-	case "unsignedShort":
-		if strings.HasPrefix(value, "-") {
-			return fmt.Errorf("value %q out of range for unsignedShort", value)
-		}
-		v, err := strconv.ParseUint(value, 10, 64)
-		if err != nil || v > math.MaxUint16 {
-			return fmt.Errorf("value %q out of range for unsignedShort (0 to 65535)", value)
-		}
-	case "unsignedByte":
-		if strings.HasPrefix(value, "-") {
-			return fmt.Errorf("value %q out of range for unsignedByte", value)
-		}
-		v, err := strconv.ParseUint(value, 10, 64)
-		if err != nil || v > math.MaxUint8 {
-			return fmt.Errorf("value %q out of range for unsignedByte (0 to 255)", value)
-		}
-	case "positiveInteger":
-		v, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return fmt.Errorf("value %q is not a valid positiveInteger", value)
-		}
-		if v < 1 {
-			return fmt.Errorf("value %q out of range for positiveInteger (must be >= 1)", value)
-		}
-	case "nonNegativeInteger":
-		if strings.HasPrefix(value, "-") && value != "-0" {
-			return fmt.Errorf("value %q out of range for nonNegativeInteger (must be >= 0)", value)
-		}
-	case "negativeInteger":
-		v, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return fmt.Errorf("value %q is not a valid negativeInteger", value)
-		}
-		if v >= 0 {
-			return fmt.Errorf("value %q out of range for negativeInteger (must be < 0)", value)
-		}
-	case "nonPositiveInteger":
-		v, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return fmt.Errorf("value %q is not a valid nonPositiveInteger", value)
-		}
-		if v > 0 {
-			return fmt.Errorf("value %q out of range for nonPositiveInteger (must be <= 0)", value)
-		}
+		return nil
+	}
+
+	v, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || v < r.min || v > r.max {
+		return fmt.Errorf("value %q out of range for %s", value, local)
 	}
 	return nil
 }
@@ -241,87 +215,50 @@ func ValidateFacetNarrowing(baseFacets, derivedFacets []Facet) []error {
 func checkNarrowing(kind FacetKind, baseVal, derivedVal string) error {
 	switch kind {
 	case FacetMinLength:
-		return requireDerivedGEBase(kind, baseVal, derivedVal)
-	case FacetMaxLength:
-		return requireDerivedLEBase(kind, baseVal, derivedVal)
-	case FacetMinInclusive:
-		return requireDerivedGEBaseFloat(kind, baseVal, derivedVal)
-	case FacetMaxInclusive:
-		return requireDerivedLEBaseFloat(kind, baseVal, derivedVal)
-	case FacetMinExclusive:
-		return requireDerivedGEBaseFloat(kind, baseVal, derivedVal)
-	case FacetMaxExclusive:
-		return requireDerivedLEBaseFloat(kind, baseVal, derivedVal)
-	case FacetTotalDigits:
-		return requireDerivedLEBase(kind, baseVal, derivedVal)
-	case FacetFractionDigits:
-		return requireDerivedLEBase(kind, baseVal, derivedVal)
+		return compareDerived(kind, baseVal, derivedVal, parseInt64, ">=")
+	case FacetMaxLength, FacetTotalDigits, FacetFractionDigits:
+		return compareDerived(kind, baseVal, derivedVal, parseInt64, "<=")
+	case FacetMinInclusive, FacetMinExclusive:
+		return compareDerived(kind, baseVal, derivedVal, parseFloat64, ">=")
+	case FacetMaxInclusive, FacetMaxExclusive:
+		return compareDerived(kind, baseVal, derivedVal, parseFloat64, "<=")
 	}
 	return nil
 }
 
-// requireDerivedGEBase checks derived >= base using integer comparison.
-func requireDerivedGEBase(kind FacetKind, baseVal, derivedVal string) error {
-	bv, err := strconv.ParseInt(baseVal, 10, 64)
+// compareDerived is a generic narrowing check. It parses both values using the
+// given parse function and verifies the derived value satisfies the given
+// relation (">=" or "<=") relative to the base value.
+func compareDerived[T int64 | float64](kind FacetKind, baseVal, derivedVal string, parse func(string) (T, error), op string) error {
+	bv, err := parse(baseVal)
 	if err != nil {
 		return nil // cannot compare; skip
 	}
-	dv, err := strconv.ParseInt(derivedVal, 10, 64)
+	dv, err := parse(derivedVal)
 	if err != nil {
 		return nil
 	}
-	if dv < bv {
-		return fmt.Errorf("facet %v value %s in derived type is less than base value %s (must be >=)", kind, derivedVal, baseVal)
+	switch op {
+	case ">=":
+		if dv < bv {
+			return fmt.Errorf("facet %v value %s in derived type is less than base value %s (must be >=)", kind, derivedVal, baseVal)
+		}
+	case "<=":
+		if dv > bv {
+			return fmt.Errorf("facet %v value %s in derived type is greater than base value %s (must be <=)", kind, derivedVal, baseVal)
+		}
 	}
 	return nil
 }
 
-// requireDerivedLEBase checks derived <= base using integer comparison.
-func requireDerivedLEBase(kind FacetKind, baseVal, derivedVal string) error {
-	bv, err := strconv.ParseInt(baseVal, 10, 64)
-	if err != nil {
-		return nil
-	}
-	dv, err := strconv.ParseInt(derivedVal, 10, 64)
-	if err != nil {
-		return nil
-	}
-	if dv > bv {
-		return fmt.Errorf("facet %v value %s in derived type is greater than base value %s (must be <=)", kind, derivedVal, baseVal)
-	}
-	return nil
+// parseInt64 parses s as a base-10 int64.
+func parseInt64(s string) (int64, error) {
+	return strconv.ParseInt(s, 10, 64)
 }
 
-// requireDerivedGEBaseFloat checks derived >= base using float comparison.
-func requireDerivedGEBaseFloat(kind FacetKind, baseVal, derivedVal string) error {
-	bv, err := strconv.ParseFloat(baseVal, 64)
-	if err != nil {
-		return nil
-	}
-	dv, err := strconv.ParseFloat(derivedVal, 64)
-	if err != nil {
-		return nil
-	}
-	if dv < bv {
-		return fmt.Errorf("facet %v value %s in derived type is less than base value %s (must be >=)", kind, derivedVal, baseVal)
-	}
-	return nil
-}
-
-// requireDerivedLEBaseFloat checks derived <= base using float comparison.
-func requireDerivedLEBaseFloat(kind FacetKind, baseVal, derivedVal string) error {
-	bv, err := strconv.ParseFloat(baseVal, 64)
-	if err != nil {
-		return nil
-	}
-	dv, err := strconv.ParseFloat(derivedVal, 64)
-	if err != nil {
-		return nil
-	}
-	if dv > bv {
-		return fmt.Errorf("facet %v value %s in derived type is greater than base value %s (must be <=)", kind, derivedVal, baseVal)
-	}
-	return nil
+// parseFloat64 parses s as a float64.
+func parseFloat64(s string) (float64, error) {
+	return strconv.ParseFloat(s, 64)
 }
 
 // ---------------------------------------------------------------------------
@@ -456,4 +393,3 @@ func isValidQNameValue(s string) bool {
 	}
 	return isValidNCName(parts[0]) && isValidNCName(parts[1])
 }
-

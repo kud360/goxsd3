@@ -22,30 +22,26 @@ type TypeProperties struct {
 	Numeric     bool
 }
 
-// BuiltinRegistry is a registry of all 49 built-in XSD types.
+// BuiltinRegistry is a registry of all 50 built-in XSD types.
 type BuiltinRegistry struct {
 	types map[QName]*BuiltinTypeInfo
 }
 
-// NewBuiltinRegistry creates a registry populated with all 49 built-in XSD types.
+// NewBuiltinRegistry creates a registry populated with all 50 built-in XSD
+// types (2 ur-types + 1 XSD 1.1 intermediate + 19 primitives + 25 derived + 3 list types).
 func NewBuiltinRegistry() *BuiltinRegistry {
 	r := &BuiltinRegistry{
-		types: make(map[QName]*BuiltinTypeInfo, 49),
+		types: make(map[QName]*BuiltinTypeInfo, 50),
 	}
 
-	// Properties by family.
-	stringProps := TypeProperties{Ordered: OrderedFalse, Bounded: false, Cardinality: CardinalityCountablyInfinite, Numeric: false}
+	// Fundamental facet property sets, grouped by shared characteristics.
+	unorderedProps := TypeProperties{Ordered: OrderedFalse, Bounded: false, Cardinality: CardinalityCountablyInfinite, Numeric: false}
 	booleanProps := TypeProperties{Ordered: OrderedFalse, Bounded: false, Cardinality: CardinalityFinite, Numeric: false}
 	decimalProps := TypeProperties{Ordered: OrderedTotal, Bounded: false, Cardinality: CardinalityCountablyInfinite, Numeric: true}
 	integerProps := TypeProperties{Ordered: OrderedTotal, Bounded: false, Cardinality: CardinalityCountablyInfinite, Numeric: true}
 	boundedIntProps := TypeProperties{Ordered: OrderedTotal, Bounded: true, Cardinality: CardinalityCountablyInfinite, Numeric: true}
 	floatProps := TypeProperties{Ordered: OrderedPartial, Bounded: true, Cardinality: CardinalityFinite, Numeric: true}
-	durationProps := TypeProperties{Ordered: OrderedPartial, Bounded: false, Cardinality: CardinalityCountablyInfinite, Numeric: false}
-	dateTimeProps := TypeProperties{Ordered: OrderedPartial, Bounded: false, Cardinality: CardinalityCountablyInfinite, Numeric: false}
-	binaryProps := TypeProperties{Ordered: OrderedFalse, Bounded: false, Cardinality: CardinalityCountablyInfinite, Numeric: false}
-	uriProps := TypeProperties{Ordered: OrderedFalse, Bounded: false, Cardinality: CardinalityCountablyInfinite, Numeric: false}
-	qnameProps := TypeProperties{Ordered: OrderedFalse, Bounded: false, Cardinality: CardinalityCountablyInfinite, Numeric: false}
-	listProps := TypeProperties{Ordered: OrderedFalse, Bounded: false, Cardinality: CardinalityCountablyInfinite, Numeric: false}
+	partialOrderProps := TypeProperties{Ordered: OrderedPartial, Bounded: false, Cardinality: CardinalityCountablyInfinite, Numeric: false}
 
 	// Helper to create a QName pointer.
 	base := func(local string) *QName {
@@ -74,16 +70,16 @@ func NewBuiltinRegistry() *BuiltinRegistry {
 	register("anyAtomicType", "string", base("anySimpleType"), "", TypeProperties{}, WhiteSpacePreserve)
 
 	// --- string family ---
-	register("string", "string", base("anyAtomicType"), "string", stringProps, WhiteSpacePreserve)
-	register("normalizedString", "string", base("string"), "string", stringProps, WhiteSpaceReplace)
-	register("token", "string", base("normalizedString"), "string", stringProps, WhiteSpaceCollapse)
-	register("language", "string", base("token"), "string", stringProps, WhiteSpaceCollapse)
-	register("NMTOKEN", "string", base("token"), "string", stringProps, WhiteSpaceCollapse)
-	register("Name", "string", base("token"), "string", stringProps, WhiteSpaceCollapse)
-	register("NCName", "string", base("Name"), "string", stringProps, WhiteSpaceCollapse)
-	register("ID", "string", base("NCName"), "string", stringProps, WhiteSpaceCollapse)
-	register("IDREF", "string", base("NCName"), "string", stringProps, WhiteSpaceCollapse)
-	register("ENTITY", "string", base("NCName"), "string", stringProps, WhiteSpaceCollapse)
+	register("string", "string", base("anyAtomicType"), "string", unorderedProps, WhiteSpacePreserve)
+	register("normalizedString", "string", base("string"), "string", unorderedProps, WhiteSpaceReplace)
+	register("token", "string", base("normalizedString"), "string", unorderedProps, WhiteSpaceCollapse)
+	register("language", "string", base("token"), "string", unorderedProps, WhiteSpaceCollapse)
+	register("NMTOKEN", "string", base("token"), "string", unorderedProps, WhiteSpaceCollapse)
+	register("Name", "string", base("token"), "string", unorderedProps, WhiteSpaceCollapse)
+	register("NCName", "string", base("Name"), "string", unorderedProps, WhiteSpaceCollapse)
+	register("ID", "string", base("NCName"), "string", unorderedProps, WhiteSpaceCollapse)
+	register("IDREF", "string", base("NCName"), "string", unorderedProps, WhiteSpaceCollapse)
+	register("ENTITY", "string", base("NCName"), "string", unorderedProps, WhiteSpaceCollapse)
 
 	// --- boolean ---
 	register("boolean", "bool", base("anyAtomicType"), "boolean", booleanProps, WhiteSpaceCollapse)
@@ -109,36 +105,36 @@ func NewBuiltinRegistry() *BuiltinRegistry {
 	register("double", "float64", base("anyAtomicType"), "double", floatProps, WhiteSpaceCollapse)
 
 	// --- duration ---
-	register("duration", "string", base("anyAtomicType"), "duration", durationProps, WhiteSpaceCollapse)
-	register("yearMonthDuration", "string", base("duration"), "duration", durationProps, WhiteSpaceCollapse)
-	register("dayTimeDuration", "string", base("duration"), "duration", durationProps, WhiteSpaceCollapse)
+	register("duration", "string", base("anyAtomicType"), "duration", partialOrderProps, WhiteSpaceCollapse)
+	register("yearMonthDuration", "string", base("duration"), "duration", partialOrderProps, WhiteSpaceCollapse)
+	register("dayTimeDuration", "string", base("duration"), "duration", partialOrderProps, WhiteSpaceCollapse)
 
 	// --- date/time ---
-	register("dateTime", "string", base("anyAtomicType"), "dateTime", dateTimeProps, WhiteSpaceCollapse)
-	register("dateTimeStamp", "string", base("dateTime"), "dateTime", dateTimeProps, WhiteSpaceCollapse)
-	register("time", "string", base("anyAtomicType"), "time", dateTimeProps, WhiteSpaceCollapse)
-	register("date", "string", base("anyAtomicType"), "date", dateTimeProps, WhiteSpaceCollapse)
-	register("gYearMonth", "string", base("anyAtomicType"), "gYearMonth", dateTimeProps, WhiteSpaceCollapse)
-	register("gYear", "string", base("anyAtomicType"), "gYear", dateTimeProps, WhiteSpaceCollapse)
-	register("gMonthDay", "string", base("anyAtomicType"), "gMonthDay", dateTimeProps, WhiteSpaceCollapse)
-	register("gDay", "string", base("anyAtomicType"), "gDay", dateTimeProps, WhiteSpaceCollapse)
-	register("gMonth", "string", base("anyAtomicType"), "gMonth", dateTimeProps, WhiteSpaceCollapse)
+	register("dateTime", "string", base("anyAtomicType"), "dateTime", partialOrderProps, WhiteSpaceCollapse)
+	register("dateTimeStamp", "string", base("dateTime"), "dateTime", partialOrderProps, WhiteSpaceCollapse)
+	register("time", "string", base("anyAtomicType"), "time", partialOrderProps, WhiteSpaceCollapse)
+	register("date", "string", base("anyAtomicType"), "date", partialOrderProps, WhiteSpaceCollapse)
+	register("gYearMonth", "string", base("anyAtomicType"), "gYearMonth", partialOrderProps, WhiteSpaceCollapse)
+	register("gYear", "string", base("anyAtomicType"), "gYear", partialOrderProps, WhiteSpaceCollapse)
+	register("gMonthDay", "string", base("anyAtomicType"), "gMonthDay", partialOrderProps, WhiteSpaceCollapse)
+	register("gDay", "string", base("anyAtomicType"), "gDay", partialOrderProps, WhiteSpaceCollapse)
+	register("gMonth", "string", base("anyAtomicType"), "gMonth", partialOrderProps, WhiteSpaceCollapse)
 
 	// --- binary ---
-	register("hexBinary", "[]byte", base("anyAtomicType"), "hexBinary", binaryProps, WhiteSpaceCollapse)
-	register("base64Binary", "[]byte", base("anyAtomicType"), "base64Binary", binaryProps, WhiteSpaceCollapse)
+	register("hexBinary", "[]byte", base("anyAtomicType"), "hexBinary", unorderedProps, WhiteSpaceCollapse)
+	register("base64Binary", "[]byte", base("anyAtomicType"), "base64Binary", unorderedProps, WhiteSpaceCollapse)
 
 	// --- anyURI ---
-	register("anyURI", "string", base("anyAtomicType"), "anyURI", uriProps, WhiteSpaceCollapse)
+	register("anyURI", "string", base("anyAtomicType"), "anyURI", unorderedProps, WhiteSpaceCollapse)
 
 	// --- QName / NOTATION ---
-	register("QName", "string", base("anyAtomicType"), "QName", qnameProps, WhiteSpaceCollapse)
-	register("NOTATION", "string", base("anyAtomicType"), "NOTATION", qnameProps, WhiteSpaceCollapse)
+	register("QName", "string", base("anyAtomicType"), "QName", unorderedProps, WhiteSpaceCollapse)
+	register("NOTATION", "string", base("anyAtomicType"), "NOTATION", unorderedProps, WhiteSpaceCollapse)
 
 	// --- list types ---
-	register("NMTOKENS", "[]string", base("anySimpleType"), "list", listProps, WhiteSpaceCollapse)
-	register("IDREFS", "[]string", base("anySimpleType"), "list", listProps, WhiteSpaceCollapse)
-	register("ENTITIES", "[]string", base("anySimpleType"), "list", listProps, WhiteSpaceCollapse)
+	register("NMTOKENS", "[]string", base("anySimpleType"), "list", unorderedProps, WhiteSpaceCollapse)
+	register("IDREFS", "[]string", base("anySimpleType"), "list", unorderedProps, WhiteSpaceCollapse)
+	register("ENTITIES", "[]string", base("anySimpleType"), "list", unorderedProps, WhiteSpaceCollapse)
 
 	return r
 }
