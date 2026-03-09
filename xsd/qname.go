@@ -39,35 +39,51 @@ type TypeRef struct {
 // WhiteSpaceRule represents the whiteSpace facet value for simple types.
 type WhiteSpaceRule string
 
+// WhiteSpaceRule values as defined by the XSD specification.
 const (
+	// WhiteSpacePreserve retains all whitespace as-is.
 	WhiteSpacePreserve WhiteSpaceRule = "preserve"
-	WhiteSpaceReplace  WhiteSpaceRule = "replace"
+	// WhiteSpaceReplace replaces tabs, newlines, and carriage returns with spaces.
+	WhiteSpaceReplace WhiteSpaceRule = "replace"
+	// WhiteSpaceCollapse replaces, then collapses runs of spaces to a single space,
+	// and trims leading/trailing whitespace.
 	WhiteSpaceCollapse WhiteSpaceRule = "collapse"
 )
 
 // Ordered represents the ordered property of a primitive type.
 type Ordered string
 
+// Ordered values for the fundamental ordered facet.
 const (
-	OrderedFalse   Ordered = "false"
+	// OrderedFalse indicates no ordering is defined for the value space.
+	OrderedFalse Ordered = "false"
+	// OrderedPartial indicates the value space has a partial order.
 	OrderedPartial Ordered = "partial"
-	OrderedTotal   Ordered = "total"
+	// OrderedTotal indicates the value space has a total order.
+	OrderedTotal Ordered = "total"
 )
 
 // Cardinality represents the cardinality property of a value space.
 type Cardinality string
 
+// Cardinality values for the fundamental cardinality facet.
 const (
-	CardinalityFinite            Cardinality = "finite"
+	// CardinalityFinite indicates the value space has a finite number of values.
+	CardinalityFinite Cardinality = "finite"
+	// CardinalityCountablyInfinite indicates the value space is countably infinite.
 	CardinalityCountablyInfinite Cardinality = "countablyInfinite"
 )
 
 // AttributeUse represents how an attribute may appear on an element.
 type AttributeUse string
 
+// AttributeUse values controlling attribute occurrence on elements.
 const (
-	AttributeOptional   AttributeUse = "optional"
-	AttributeRequired   AttributeUse = "required"
+	// AttributeOptional means the attribute may or may not appear.
+	AttributeOptional AttributeUse = "optional"
+	// AttributeRequired means the attribute must appear.
+	AttributeRequired AttributeUse = "required"
+	// AttributeProhibited means the attribute must not appear.
 	AttributeProhibited AttributeUse = "prohibited"
 )
 

@@ -8,27 +8,28 @@ import (
 // FacetKind identifies a constraining facet defined by the XSD specification.
 type FacetKind string
 
-// XSD 1.0 facets.
+// XSD 1.0 constraining facets (14 total). Each corresponds to an
+// xs:<facetName> element that may appear in a restriction derivation.
 const (
-	FacetLength         FacetKind = "length"
-	FacetMinLength      FacetKind = "minLength"
-	FacetMaxLength      FacetKind = "maxLength"
-	FacetPattern        FacetKind = "pattern"
-	FacetEnumeration    FacetKind = "enumeration"
-	FacetWhiteSpace     FacetKind = "whiteSpace"
-	FacetMaxInclusive   FacetKind = "maxInclusive"
-	FacetMaxExclusive   FacetKind = "maxExclusive"
-	FacetMinInclusive   FacetKind = "minInclusive"
-	FacetMinExclusive   FacetKind = "minExclusive"
-	FacetTotalDigits    FacetKind = "totalDigits"
-	FacetFractionDigits FacetKind = "fractionDigits"
+	FacetLength         FacetKind = "length"         // exact required length
+	FacetMinLength      FacetKind = "minLength"      // minimum required length
+	FacetMaxLength      FacetKind = "maxLength"      // maximum allowed length
+	FacetPattern        FacetKind = "pattern"         // regex pattern constraint
+	FacetEnumeration    FacetKind = "enumeration"     // set of allowed values
+	FacetWhiteSpace     FacetKind = "whiteSpace"      // whitespace normalization rule
+	FacetMaxInclusive   FacetKind = "maxInclusive"    // upper bound (inclusive)
+	FacetMaxExclusive   FacetKind = "maxExclusive"    // upper bound (exclusive)
+	FacetMinInclusive   FacetKind = "minInclusive"    // lower bound (inclusive)
+	FacetMinExclusive   FacetKind = "minExclusive"    // lower bound (exclusive)
+	FacetTotalDigits    FacetKind = "totalDigits"     // maximum number of digits
+	FacetFractionDigits FacetKind = "fractionDigits"  // maximum fractional digits
 )
 
-// XSD 1.1 facets.
+// XSD 1.1 constraining facets (3 additional).
 const (
-	FacetExplicitTimezone FacetKind = "explicitTimezone"
-	FacetMinScale         FacetKind = "minScale"
-	FacetMaxScale         FacetKind = "maxScale"
+	FacetExplicitTimezone FacetKind = "explicitTimezone" // timezone requirement for date/time types
+	FacetMinScale         FacetKind = "minScale"         // minimum scale for decimal
+	FacetMaxScale         FacetKind = "maxScale"         // maximum scale for decimal
 )
 
 // Facet represents a single constraining facet applied to a simple type.
