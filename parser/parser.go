@@ -19,8 +19,9 @@ type Parser struct {
 	visited     map[string]bool
 	logger      *slog.Logger
 	builtin     *xsd.BuiltinRegistry
-	symbols     *SymbolTable
-	pendingRefs []pendingRef
+	symbols          *SymbolTable
+	pendingRefs      []pendingRef
+	validationErrors []error
 }
 
 // New creates a new Parser with the given options.
@@ -58,6 +59,11 @@ func (p *Parser) Parse(files ...string) (*xsd.SchemaSet, error) {
 	// Resolve any remaining forward references.
 	p.resolveForwardRefs()
 
+	// Return validation errors if any accumulated.
+	if len(p.validationErrors) > 0 {
+		return nil, p.combineValidationErrors()
+	}
+
 	ss := xsd.NewSchemaSet()
 	for _, s := range p.schemas {
 		ss.AddSchema(s)
@@ -81,6 +87,11 @@ func (p *Parser) ParseReader(r io.Reader, systemID string) (*xsd.SchemaSet, erro
 	// Resolve any remaining forward references.
 	p.resolveForwardRefs()
 
+	// Return validation errors if any accumulated.
+	if len(p.validationErrors) > 0 {
+		return nil, p.combineValidationErrors()
+	}
+
 	ss := xsd.NewSchemaSet()
 	for _, s := range p.schemas {
 		ss.AddSchema(s)
@@ -92,6 +103,20 @@ func (p *Parser) ParseReader(r io.Reader, systemID string) (*xsd.SchemaSet, erro
 		}
 	}
 	return ss, nil
+}
+
+// combineValidationErrors joins all accumulated validation errors into one.
+func (p *Parser) combineValidationErrors() error {
+	if len(p.validationErrors) == 1 {
+		return p.validationErrors[0]
+	}
+	var sb strings.Builder
+	sb.WriteString("schema validation failed:")
+	for _, err := range p.validationErrors {
+		sb.WriteString("\n  - ")
+		sb.WriteString(err.Error())
+	}
+	return fmt.Errorf("%s", sb.String())
 }
 
 // Symbols returns the parser's symbol table for inspection in tests.
@@ -348,6 +373,10 @@ func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error) {
 					continue
 				}
 				elem := ctx.element
+				// Validate default/fixed values.
+				if errs := p.validateElementDefaults(elem); len(errs) > 0 {
+					p.validationErrors = append(p.validationErrors, errs...)
+				}
 				p.addElementToContext(elem, stack, schema)
 
 			case "complexType":
@@ -368,6 +397,10 @@ func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error) {
 				}
 				st := ctx.simpleTyp
 				p.addTypeToContext(st, stack, schema)
+				// Validate restriction facets.
+				if errs := p.validateSimpleTypeRestriction(st); len(errs) > 0 {
+					p.validationErrors = append(p.validationErrors, errs...)
+				}
 				p.logger.Debug("parsed simpleType",
 					slog.String("name", st.Name.Local))
 
