@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <!-- All three compositors in one type -->
+  <xs:complexType name="MixedCompType">
+    <xs:sequence>
+      <xs:element name="header" type="xs:string"/>
+      <xs:choice>
+        <xs:element name="optA" type="xs:string"/>
+        <xs:element name="optB" type="xs:string"/>
+      </xs:choice>
+      <xs:all>
+        <xs:element name="x" type="xs:integer"/>
+        <xs:element name="y" type="xs:integer"/>
+      </xs:all>
+      <xs:element name="footer" type="xs:string"/>
+    </xs:sequence>
+  </xs:complexType>
+</xs:schema>

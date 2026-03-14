@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <!-- 4+ levels: sequence > choice > sequence > choice -->
+  <xs:complexType name="DeepType">
+    <xs:sequence>
+      <xs:element name="level1" type="xs:string"/>
+      <xs:choice>
+        <xs:sequence>
+          <xs:element name="level3a" type="xs:string"/>
+          <xs:choice>
+            <xs:element name="level4a" type="xs:string"/>
+            <xs:element name="level4b" type="xs:integer"/>
+          </xs:choice>
+        </xs:sequence>
+        <xs:element name="level2alt" type="xs:string"/>
+      </xs:choice>
+    </xs:sequence>
+  </xs:complexType>
+</xs:schema>

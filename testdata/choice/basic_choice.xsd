@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <xs:complexType name="PaymentType">
+    <xs:choice>
+      <xs:element name="creditCard" type="xs:string"/>
+      <xs:element name="bankTransfer" type="xs:string"/>
+      <xs:element name="cash" type="xs:boolean"/>
+    </xs:choice>
+  </xs:complexType>
+</xs:schema>
