@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:b="http://example.com/base"
+           targetNamespace="http://example.com/right">
+  <xs:import namespace="http://example.com/base" schemaLocation="base.xsd"/>
+
+  <xs:element name="rightItem" type="xs:string"/>
+</xs:schema>

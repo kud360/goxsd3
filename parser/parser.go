@@ -1,11 +1,13 @@
 package parser
 
 import (
+	"bytes"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -292,12 +294,24 @@ func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error) {
 				p.logger.Debug("recorded import",
 					slog.String("namespace", imp.Namespace),
 					slog.String("location", imp.SchemaLocation))
+				// Follow import if resolver is available.
+				if imp.SchemaLocation != "" && p.opts.Resolver != nil {
+					if err := p.followImport(imp, systemID); err != nil {
+						return nil, err
+					}
+				}
 
 			case "include":
 				inc := p.buildInclude(t.Attr, loc())
 				schema.Includes = append(schema.Includes, inc)
 				p.logger.Debug("recorded include",
 					slog.String("location", inc.SchemaLocation))
+				// Follow include if resolver is available.
+				if inc.SchemaLocation != "" && p.opts.Resolver != nil {
+					if err := p.followInclude(inc, systemID, schema.TargetNamespace); err != nil {
+						return nil, err
+					}
+				}
 
 			// Facet elements inside restriction.
 			case "enumeration", "pattern", "minLength", "maxLength", "length",
@@ -980,6 +994,72 @@ func (p *Parser) resolveForwardRefs() {
 	}
 	// Clear pending refs.
 	p.pendingRefs = p.pendingRefs[:0]
+}
+
+// ---------------------------------------------------------------------------
+// Import / Include following
+// ---------------------------------------------------------------------------
+
+// followImport resolves and parses an imported schema document.
+func (p *Parser) followImport(imp *xsd.Import, baseURI string) error {
+	data, err := p.opts.Resolver.Resolve(imp.SchemaLocation, baseURI, imp.Namespace)
+	if err != nil {
+		p.logger.Warn("failed to resolve import",
+			slog.String("location", imp.SchemaLocation),
+			slog.String("error", err.Error()))
+		return nil // non-fatal: import may be optional
+	}
+
+	// Use the resolved location as the systemID for cycle detection.
+	resolvedID := resolveLocation(imp.SchemaLocation, baseURI)
+	r := bytes.NewReader(data)
+	_, err = p.parseOne(r, resolvedID)
+	if err != nil {
+		return fmt.Errorf("parsing imported schema %s: %w", imp.SchemaLocation, err)
+	}
+	return nil
+}
+
+// followInclude resolves and parses an included schema document.
+// For xs:include, the included schema adopts the including schema's
+// target namespace if it has none (chameleon include).
+func (p *Parser) followInclude(inc *xsd.Include, baseURI, targetNS string) error {
+	data, err := p.opts.Resolver.Resolve(inc.SchemaLocation, baseURI, "")
+	if err != nil {
+		return fmt.Errorf("resolving include %s: %w", inc.SchemaLocation, err)
+	}
+
+	resolvedID := resolveLocation(inc.SchemaLocation, baseURI)
+	r := bytes.NewReader(data)
+	schema, err := p.parseOne(r, resolvedID)
+	if err != nil {
+		return fmt.Errorf("parsing included schema %s: %w", inc.SchemaLocation, err)
+	}
+
+	// Chameleon include: if included schema has no target namespace,
+	// adopt the including schema's namespace.
+	if schema != nil && schema.TargetNamespace == "" && targetNS != "" {
+		schema.TargetNamespace = targetNS
+		p.logger.Debug("chameleon include: adopted target namespace",
+			slog.String("location", inc.SchemaLocation),
+			slog.String("namespace", targetNS))
+	}
+
+	return nil
+}
+
+// resolveLocation resolves a relative location against a base URI.
+func resolveLocation(location, baseURI string) string {
+	if location == "" {
+		return baseURI
+	}
+	if filepath.IsAbs(location) {
+		return location
+	}
+	if baseURI == "" {
+		return location
+	}
+	return filepath.Join(filepath.Dir(baseURI), location)
 }
 
 // ---------------------------------------------------------------------------
