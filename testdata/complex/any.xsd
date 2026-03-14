@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <!-- xs:any wildcard in sequence -->
+  <xs:complexType name="ExtensibleType">
+    <xs:sequence>
+      <xs:element name="known" type="xs:string"/>
+      <xs:any namespace="##other" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:anyAttribute namespace="##any" processContents="skip"/>
+  </xs:complexType>
+</xs:schema>

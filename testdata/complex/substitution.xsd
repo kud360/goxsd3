@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <!-- Base element that heads a substitution group -->
+  <xs:element name="shape" type="xs:string" abstract="true"/>
+
+  <!-- Substitution group members -->
+  <xs:element name="circle" substitutionGroup="shape" type="xs:string"/>
+  <xs:element name="square" substitutionGroup="shape" type="xs:string"/>
+  <xs:element name="triangle" substitutionGroup="shape" type="xs:string"/>
+</xs:schema>
