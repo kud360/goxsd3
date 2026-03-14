@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <!-- Forward reference: element uses a type defined later -->
+  <xs:element name="order" type="OrderType"/>
+
+  <!-- Another forward reference -->
+  <xs:element name="customer" type="CustomerType"/>
+
+  <!-- OrderType references CustomerType (also forward) -->
+  <xs:complexType name="OrderType">
+    <xs:sequence>
+      <xs:element name="item" type="xs:string"/>
+      <xs:element name="buyer" type="CustomerType"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <!-- Backward reference: OrderType is already defined -->
+  <xs:element name="pastOrder" type="OrderType"/>
+
+  <!-- CustomerType defined last -->
+  <xs:complexType name="CustomerType">
+    <xs:sequence>
+      <xs:element name="name" type="xs:string"/>
+      <xs:element name="email" type="xs:string"/>
+    </xs:sequence>
+  </xs:complexType>
+</xs:schema>

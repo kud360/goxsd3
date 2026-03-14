@@ -14,11 +14,13 @@ import (
 
 // Parser reads XSD documents using xml.Decoder and builds the schema model.
 type Parser struct {
-	opts    Options
-	schemas []*xsd.Schema
-	visited map[string]bool
-	logger  *slog.Logger
-	builtin *xsd.BuiltinRegistry
+	opts        Options
+	schemas     []*xsd.Schema
+	visited     map[string]bool
+	logger      *slog.Logger
+	builtin     *xsd.BuiltinRegistry
+	symbols     *SymbolTable
+	pendingRefs []pendingRef
 }
 
 // New creates a new Parser with the given options.
@@ -33,6 +35,7 @@ func New(opts ...Option) *Parser {
 		visited: make(map[string]bool),
 		logger:  o.Logger,
 		builtin: xsd.NewBuiltinRegistry(),
+		symbols: NewSymbolTable(),
 	}
 }
 
@@ -51,6 +54,9 @@ func (p *Parser) Parse(files ...string) (*xsd.SchemaSet, error) {
 			return nil, err
 		}
 	}
+
+	// Resolve any remaining forward references.
+	p.resolveForwardRefs()
 
 	ss := xsd.NewSchemaSet()
 	for _, s := range p.schemas {
@@ -72,6 +78,9 @@ func (p *Parser) ParseReader(r io.Reader, systemID string) (*xsd.SchemaSet, erro
 		return nil, err
 	}
 
+	// Resolve any remaining forward references.
+	p.resolveForwardRefs()
+
 	ss := xsd.NewSchemaSet()
 	for _, s := range p.schemas {
 		ss.AddSchema(s)
@@ -83,6 +92,11 @@ func (p *Parser) ParseReader(r io.Reader, systemID string) (*xsd.SchemaSet, erro
 		}
 	}
 	return ss, nil
+}
+
+// Symbols returns the parser's symbol table for inspection in tests.
+func (p *Parser) Symbols() *SymbolTable {
+	return p.symbols
 }
 
 // buildContext tracks the current parsing context stack.
@@ -198,7 +212,7 @@ func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error) {
 				push(&buildContext{kind: "all", compositor: cb})
 
 			case "attribute":
-				attr := p.buildAttribute(t.Attr, loc())
+				attr := p.buildAttribute(t.Attr, loc(), schema)
 				// Add to nearest complexType or extension.
 				p.addAttributeToContext(attr, stack)
 
@@ -269,8 +283,9 @@ func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error) {
 				if ctx := peek(); ctx != nil && ctx.kind == "simpleType" && ctx.simpleTyp != nil {
 					itemType := p.resolveQName(attrVal(t.Attr, "itemType"), schema)
 					ctx.simpleTyp.List = &xsd.ListType{
-						ItemType: xsd.TypeRef{Name: itemType},
+						ItemType: p.makeTypeRef(itemType),
 					}
+					p.trackRef(&ctx.simpleTyp.List.ItemType)
 				}
 
 			case "union":
@@ -280,10 +295,14 @@ func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error) {
 					if memberTypesStr != "" {
 						for _, mt := range strings.Fields(memberTypesStr) {
 							qn := p.resolveQName(mt, schema)
-							memberTypes = append(memberTypes, xsd.TypeRef{Name: qn})
+							memberTypes = append(memberTypes, p.makeTypeRef(qn))
 						}
 					}
 					ctx.simpleTyp.Union = &xsd.UnionType{MemberTypes: memberTypes}
+					// Track unresolved union member refs.
+					for i := range ctx.simpleTyp.Union.MemberTypes {
+						p.trackRef(&ctx.simpleTyp.Union.MemberTypes[i])
+					}
 				}
 
 			case "group":
@@ -442,7 +461,7 @@ func (p *Parser) buildElement(attrs []xml.Attr, loc xsd.Location, schema *xsd.Sc
 		case "name":
 			elem.Name = a.Value
 		case "type":
-			elem.Type = xsd.TypeRef{Name: p.resolveQName(a.Value, schema)}
+			elem.Type = p.makeTypeRef(p.resolveQName(a.Value, schema))
 		case "minOccurs":
 			elem.MinOccurs = parseOccurs(a.Value, 1)
 		case "maxOccurs":
@@ -462,10 +481,11 @@ func (p *Parser) buildElement(attrs []xml.Attr, loc xsd.Location, schema *xsd.Sc
 			elem.SubstitutionGroup = &qn
 		}
 	}
+	p.trackRef(&elem.Type)
 	return elem
 }
 
-func (p *Parser) buildAttribute(attrs []xml.Attr, loc xsd.Location) *xsd.Attribute {
+func (p *Parser) buildAttribute(attrs []xml.Attr, loc xsd.Location, schema *xsd.Schema) *xsd.Attribute {
 	attr := &xsd.Attribute{
 		Use:      xsd.AttributeOptional,
 		Location: loc,
@@ -475,8 +495,7 @@ func (p *Parser) buildAttribute(attrs []xml.Attr, loc xsd.Location) *xsd.Attribu
 		case "name":
 			attr.Name = a.Value
 		case "type":
-			// Attribute types are always in XSD namespace context; simplified for now.
-			attr.Type = xsd.TypeRef{Name: xsd.XSDName(a.Value)}
+			attr.Type = p.makeTypeRef(p.resolveQName(a.Value, schema))
 		case "use":
 			attr.Use = xsd.AttributeUse(a.Value)
 		case "default":
@@ -487,6 +506,7 @@ func (p *Parser) buildAttribute(attrs []xml.Attr, loc xsd.Location) *xsd.Attribu
 			attr.Fixed = &v
 		}
 	}
+	p.trackRef(&attr.Type)
 	return attr
 }
 
@@ -560,9 +580,10 @@ func (p *Parser) buildRestriction(attrs []xml.Attr, schema *xsd.Schema) *xsd.Res
 	r := &xsd.Restriction{}
 	for _, a := range attrs {
 		if a.Name.Local == "base" {
-			r.Base = xsd.TypeRef{Name: p.resolveQName(a.Value, schema)}
+			r.Base = p.makeTypeRef(p.resolveQName(a.Value, schema))
 		}
 	}
+	p.trackRef(&r.Base)
 	return r
 }
 
@@ -570,9 +591,10 @@ func (p *Parser) buildExtension(attrs []xml.Attr, schema *xsd.Schema) *xsd.Exten
 	ext := &xsd.Extension{}
 	for _, a := range attrs {
 		if a.Name.Local == "base" {
-			ext.Base = xsd.TypeRef{Name: p.resolveQName(a.Value, schema)}
+			ext.Base = p.makeTypeRef(p.resolveQName(a.Value, schema))
 		}
 	}
+	p.trackRef(&ext.Base)
 	return ext
 }
 
@@ -633,6 +655,12 @@ func (p *Parser) addElementToContext(elem *xsd.Element, stack []*buildContext, s
 }
 
 func (p *Parser) addTypeToContext(t xsd.Type, stack []*buildContext, schema *xsd.Schema) {
+	// Register named types in the symbol table immediately for
+	// incremental resolution of backward references.
+	if name := t.TypeName(); name.Local != "" {
+		p.symbols.AddType(t)
+	}
+
 	for i := len(stack) - 1; i >= 0; i-- {
 		ctx := stack[i]
 		if ctx.kind == "element" && ctx.element != nil {
@@ -777,6 +805,73 @@ func (p *Parser) addAnnotationToContext(ann *xsd.Annotation, stack []*buildConte
 			return
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Type reference resolution
+// ---------------------------------------------------------------------------
+
+// makeTypeRef creates a TypeRef with eager resolution. If the type
+// is already known (built-in or previously parsed), Resolved is set
+// immediately. The returned TypeRef is a value — the caller must store
+// it in the final location, then call trackRef on the stored pointer
+// if eager resolution failed.
+func (p *Parser) makeTypeRef(qname xsd.QName) xsd.TypeRef {
+	ref := xsd.TypeRef{Name: qname}
+	if qname.Local == "" {
+		return ref
+	}
+	// Eagerly resolve against built-in types and symbol table.
+	if p.builtin.Lookup(qname) != nil {
+		resolved := qname
+		ref.Resolved = &resolved
+	} else if p.symbols.LookupType(qname) != nil {
+		resolved := qname
+		ref.Resolved = &resolved
+	}
+	return ref
+}
+
+// trackRef registers a pointer to a stored TypeRef for forward reference
+// resolution. Only call this if makeTypeRef returned an unresolved ref.
+func (p *Parser) trackRef(ref *xsd.TypeRef) {
+	if ref.Resolved != nil || ref.Name.Local == "" {
+		return
+	}
+	p.pendingRefs = append(p.pendingRefs, pendingRef{ref: ref, qname: ref.Name})
+	p.logger.Debug("deferred type reference",
+		slog.String("ref", ref.Name.String()))
+}
+
+// resolveForwardRefs resolves all pending forward references against the
+// symbol table. Called after all documents in a Parse call are processed.
+func (p *Parser) resolveForwardRefs() {
+	var unresolved int
+	for i := range p.pendingRefs {
+		pr := &p.pendingRefs[i]
+		if pr.ref.Resolved != nil {
+			continue // already resolved
+		}
+		if p.symbols.LookupType(pr.qname) != nil {
+			resolved := pr.qname
+			pr.ref.Resolved = &resolved
+			p.logger.Debug("resolved forward reference",
+				slog.String("ref", pr.qname.String()))
+		} else if p.builtin.Lookup(pr.qname) != nil {
+			resolved := pr.qname
+			pr.ref.Resolved = &resolved
+		} else {
+			unresolved++
+			p.logger.Warn("unresolved type reference",
+				slog.String("ref", pr.qname.String()))
+		}
+	}
+	if unresolved > 0 {
+		p.logger.Warn("unresolved references remain",
+			slog.Int("count", unresolved))
+	}
+	// Clear pending refs.
+	p.pendingRefs = p.pendingRefs[:0]
 }
 
 // ---------------------------------------------------------------------------

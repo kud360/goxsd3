@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <xs:complexType name="BaseType">
+    <xs:sequence>
+      <xs:element name="id" type="xs:integer"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="DerivedType">
+    <xs:complexContent>
+      <xs:extension base="BaseType">
+        <xs:sequence>
+          <xs:element name="name" type="xs:string"/>
+        </xs:sequence>
+        <xs:attribute name="version" type="xs:integer"/>
+      </xs:extension>
+    </xs:complexContent>
+  </xs:complexType>
+</xs:schema>

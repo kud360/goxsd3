@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <xs:complexType name="BaseType">
+    <xs:sequence>
+      <xs:element name="name" type="xs:string"/>
+      <xs:element name="desc" type="xs:string" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="StrictType">
+    <xs:complexContent>
+      <xs:restriction base="BaseType">
+        <xs:sequence>
+          <xs:element name="name" type="xs:string"/>
+        </xs:sequence>
+      </xs:restriction>
+    </xs:complexContent>
+  </xs:complexType>
+</xs:schema>

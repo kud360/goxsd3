@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <!-- A restricts xs:string -->
+  <xs:simpleType name="NonEmptyString">
+    <xs:restriction base="xs:string">
+      <xs:minLength value="1"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- B restricts A -->
+  <xs:simpleType name="ShortNonEmptyString">
+    <xs:restriction base="NonEmptyString">
+      <xs:maxLength value="50"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- C restricts B -->
+  <xs:simpleType name="TinyString">
+    <xs:restriction base="ShortNonEmptyString">
+      <xs:maxLength value="10"/>
+    </xs:restriction>
+  </xs:simpleType>
+</xs:schema>

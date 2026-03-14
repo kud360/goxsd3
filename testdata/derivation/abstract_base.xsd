@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <xs:complexType name="Vehicle" abstract="true">
+    <xs:sequence>
+      <xs:element name="make" type="xs:string"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="Car">
+    <xs:complexContent>
+      <xs:extension base="Vehicle">
+        <xs:sequence>
+          <xs:element name="doors" type="xs:integer"/>
+        </xs:sequence>
+      </xs:extension>
+    </xs:complexContent>
+  </xs:complexType>
+
+  <xs:complexType name="Truck">
+    <xs:complexContent>
+      <xs:extension base="Vehicle">
+        <xs:sequence>
+          <xs:element name="payload" type="xs:decimal"/>
+        </xs:sequence>
+      </xs:extension>
+    </xs:complexContent>
+  </xs:complexType>
+</xs:schema>
