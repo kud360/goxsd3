@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <xs:simpleType name="StringOrInt">
+    <xs:union memberTypes="xs:string xs:integer"/>
+  </xs:simpleType>
+
+  <xs:simpleType name="StatusCode">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="active"/>
+      <xs:enumeration value="inactive"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="StatusOrNumber">
+    <xs:union memberTypes="StatusCode xs:integer"/>
+  </xs:simpleType>
+</xs:schema>
