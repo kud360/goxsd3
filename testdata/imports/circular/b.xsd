@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:a="http://example.com/a"
+           targetNamespace="http://example.com/b">
+  <xs:import namespace="http://example.com/a" schemaLocation="a.xsd"/>
+
+  <xs:element name="fromB" type="xs:string"/>
+</xs:schema>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- No targetNamespace: this is a chameleon schema.
+     It adopts the including schema's namespace. -->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:simpleType name="PhoneType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="\d{3}-\d{4}"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:element name="phone" type="PhoneType"/>
+</xs:schema>

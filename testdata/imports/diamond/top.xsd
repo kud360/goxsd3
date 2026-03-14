@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:l="http://example.com/left"
+           xmlns:r="http://example.com/right"
+           targetNamespace="http://example.com/top">
+  <xs:import namespace="http://example.com/left" schemaLocation="left.xsd"/>
+  <xs:import namespace="http://example.com/right" schemaLocation="right.xsd"/>
+
+  <xs:element name="topItem" type="xs:string"/>
+</xs:schema>

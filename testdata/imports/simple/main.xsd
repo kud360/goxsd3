@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:t="http://example.com/types"
+           targetNamespace="http://example.com/main">
+  <xs:import namespace="http://example.com/types" schemaLocation="types.xsd"/>
+
+  <xs:element name="person">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="name" type="t:NameType"/>
+        <xs:element name="address" type="t:AddressType"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>
