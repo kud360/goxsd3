@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <!-- Named attribute group -->
+  <xs:attributeGroup name="CommonAttrs">
+    <xs:attribute name="id" type="xs:integer" use="required"/>
+    <xs:attribute name="version" type="xs:string"/>
+  </xs:attributeGroup>
+
+  <!-- ComplexType referencing the attribute group -->
+  <xs:complexType name="DocumentType">
+    <xs:sequence>
+      <xs:element name="title" type="xs:string"/>
+    </xs:sequence>
+    <xs:attributeGroup ref="CommonAttrs"/>
+  </xs:complexType>
+</xs:schema>

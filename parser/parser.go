@@ -136,6 +136,8 @@ type buildContext struct {
 	restrict   *xsd.Restriction
 	extension  *xsd.Extension
 	annotation *xsd.Annotation
+	group      *xsd.Group
+	attrGroup  *xsd.AttributeGroup
 }
 
 // compositorBuilder accumulates particles for a compositor being built.
@@ -335,9 +337,7 @@ func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error) {
 				ref := attrVal(t.Attr, "ref")
 				if name != "" {
 					g := &xsd.Group{Name: name, Location: loc()}
-					push(&buildContext{kind: "group"})
-					// We'll add the group to the schema on EndElement.
-					_ = g
+					push(&buildContext{kind: "group", group: g})
 				} else if ref != "" {
 					qn := p.resolveQName(ref, schema)
 					gr := &xsd.GroupRef{
@@ -348,6 +348,18 @@ func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error) {
 					p.addParticleToContext(gr, stack)
 				}
 
+			case "attributeGroup":
+				name := attrVal(t.Attr, "name")
+				ref := attrVal(t.Attr, "ref")
+				if name != "" {
+					ag := &xsd.AttributeGroup{Name: name, Location: loc()}
+					push(&buildContext{kind: "attributeGroup", attrGroup: ag})
+				} else if ref != "" {
+					qn := p.resolveQName(ref, schema)
+					agRef := &xsd.AttributeGroupRef{Ref: qn}
+					p.addAttributeGroupRefToContext(agRef, stack)
+				}
+
 			case "any":
 				any := &xsd.Any{
 					Namespace:       attrVal(t.Attr, "namespace"),
@@ -356,6 +368,13 @@ func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error) {
 					MaxOccurs:       parseOccurs(attrVal(t.Attr, "maxOccurs"), 1),
 				}
 				p.addParticleToContext(any, stack)
+
+			case "anyAttribute":
+				anyAttr := &xsd.AnyAttribute{
+					Namespace:       attrVal(t.Attr, "namespace"),
+					ProcessContents: attrValDefault(t.Attr, "processContents", "strict"),
+				}
+				p.addAnyAttributeToContext(anyAttr, stack)
 			}
 
 		case xml.EndElement:
@@ -439,6 +458,28 @@ func (p *Parser) parseOne(r io.Reader, systemID string) (*xsd.Schema, error) {
 					continue
 				}
 				p.addComplexContentToContext(ctx.content.cc, stack)
+
+			case "group":
+				// Only pop if we pushed a group definition context (not a ref).
+				if top := peek(); top != nil && top.kind == "group" {
+					ctx := pop()
+					if ctx.group != nil {
+						schema.AddGroup(ctx.group)
+						p.logger.Debug("parsed group",
+							slog.String("name", ctx.group.Name))
+					}
+				}
+
+			case "attributeGroup":
+				// Only pop if we pushed an attributeGroup definition context (not a ref).
+				if top := peek(); top != nil && top.kind == "attributeGroup" {
+					ctx := pop()
+					if ctx.attrGroup != nil {
+						schema.AttributeGroups = append(schema.AttributeGroups, ctx.attrGroup)
+						p.logger.Debug("parsed attributeGroup",
+							slog.String("name", ctx.attrGroup.Name))
+					}
+				}
 
 			case "annotation":
 				ctx := pop()
@@ -725,6 +766,9 @@ func (p *Parser) addCompositorToContext(comp xsd.Compositor, stack []*buildConte
 		case ctx.kind == "restriction" && ctx.restrict != nil:
 			ctx.restrict.Content = comp
 			return
+		case ctx.kind == "group" && ctx.group != nil:
+			ctx.group.Compositor = comp
+			return
 		}
 	}
 }
@@ -738,6 +782,9 @@ func (p *Parser) addAttributeToContext(attr *xsd.Attribute, stack []*buildContex
 			return
 		case ctx.kind == "extension" && ctx.extension != nil:
 			ctx.extension.Attributes = append(ctx.extension.Attributes, attr)
+			return
+		case ctx.kind == "attributeGroup" && ctx.attrGroup != nil:
+			ctx.attrGroup.Attributes = append(ctx.attrGroup.Attributes, attr)
 			return
 		}
 	}
@@ -815,6 +862,34 @@ func (p *Parser) addParticleToContext(particle xsd.Particle, stack []*buildConte
 		ctx := stack[i]
 		if ctx.kind == "sequence" || ctx.kind == "choice" || ctx.kind == "all" {
 			ctx.compositor.items = append(ctx.compositor.items, particle)
+			return
+		}
+	}
+}
+
+func (p *Parser) addAttributeGroupRefToContext(ref *xsd.AttributeGroupRef, stack []*buildContext) {
+	for i := len(stack) - 1; i >= 0; i-- {
+		ctx := stack[i]
+		switch {
+		case ctx.kind == "complexType" && ctx.complexTyp != nil:
+			ctx.complexTyp.AttributeGroups = append(ctx.complexTyp.AttributeGroups, ref)
+			return
+		case ctx.kind == "extension" && ctx.extension != nil:
+			ctx.extension.AttributeGroups = append(ctx.extension.AttributeGroups, ref)
+			return
+		}
+	}
+}
+
+func (p *Parser) addAnyAttributeToContext(anyAttr *xsd.AnyAttribute, stack []*buildContext) {
+	for i := len(stack) - 1; i >= 0; i-- {
+		ctx := stack[i]
+		switch {
+		case ctx.kind == "complexType" && ctx.complexTyp != nil:
+			ctx.complexTyp.AnyAttribute = anyAttr
+			return
+		case ctx.kind == "extension" && ctx.extension != nil:
+			ctx.extension.AnyAttribute = anyAttr
 			return
 		}
 	}
