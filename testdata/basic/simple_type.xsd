@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <xs:simpleType name="ColorType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="red"/>
+      <xs:enumeration value="green"/>
+      <xs:enumeration value="blue"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="ZipCode">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[0-9]{5}(-[0-9]{4})?"/>
+      <xs:maxLength value="10"/>
+    </xs:restriction>
+  </xs:simpleType>
+</xs:schema>

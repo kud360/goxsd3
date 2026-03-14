@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <xs:element name="firstName" type="xs:string"/>
+  <xs:element name="age" type="xs:integer"/>
+  <xs:element name="active" type="xs:boolean"/>
+</xs:schema>
