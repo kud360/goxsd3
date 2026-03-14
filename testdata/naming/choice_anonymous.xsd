@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://example.com/test">
+  <!-- Anonymous types inside choice variants -->
+  <xs:complexType name="ShapeType">
+    <xs:choice>
+      <xs:element name="circle">
+        <xs:complexType>
+          <xs:sequence>
+            <xs:element name="radius" type="xs:decimal"/>
+          </xs:sequence>
+        </xs:complexType>
+      </xs:element>
+      <xs:element name="square">
+        <xs:complexType>
+          <xs:sequence>
+            <xs:element name="side" type="xs:decimal"/>
+          </xs:sequence>
+        </xs:complexType>
+      </xs:element>
+    </xs:choice>
+  </xs:complexType>
+</xs:schema>
